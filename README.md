@@ -45,14 +45,13 @@ If Paqet fails to install automatically during configuration
    ```bash
    /root/paqet/
    ```
-If the folder doesn't exist, create it first:
+   If the folder doesn't exist, create it first:
    ```bash
     mkdir -p /root/paqet
-  ```
-Example (assuming you downloaded the file to your Downloads folder):
-  ```bash
-  mv ~/Downloads/paqet-linux-amd64-v*.tar.gz /root/paqet/
-  ```
+   ```
 
 3. Run the manager script again
    The script will automatically detect the file inside /root/paqet/, use it instead of trying to download again, extract it, and complete the installation.
+   ```bash
+   bash <(curl -fsSL https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager.sh)
+   ```
