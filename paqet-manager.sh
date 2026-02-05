@@ -2,7 +2,7 @@
 
 #=================================================
 # Paqet Tunnel Manager
-# Version: 3.3
+# Version: 3.4
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Design and development by: https://github.com/behzadea12 - https://t.me/behzad_developer
@@ -19,7 +19,7 @@ WHITE='\033[1;37m'
 NC='\033[0m'
 
 # Configuration
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="3.4"
 PAQET_VERSION="v1.0.0-alpha.12"
 CONFIG_DIR="/etc/paqet"
 SERVICE_DIR="/etc/systemd/system"
@@ -42,7 +42,7 @@ show_banner() {
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
-    echo "║                                 Manager v3.3                 ║"
+    echo "║                                 Manager v3.4                 ║"
     echo "║                                                              ║"
     echo "║          https://t.me/behzad_developer                       ║"
     echo "║          https://github.com/behzadea12                       ║"    
@@ -235,7 +235,6 @@ generate_secret_key() {
     fi
 }
 
-# Download and install Paqet binary
 # Download and install Paqet binary
 install_paqet() {
     print_step "Installing Paqet binary..."
@@ -453,11 +452,42 @@ get_kcp_mode_config() {
     
     # Display to terminal (not to stdout)
     echo -e "${YELLOW}Select KCP mode:${NC}" >&2
-    echo -e "  1) fast (default - optimized for speed)" >&2
-    echo -e "  2) manual (custom configuration)" >&2
-    read -p "Choose [1-2]: " mode_choice >&2
+    echo -e "  0) normal  ${CYAN}(Normal speed – Normal latency – Low resource usage)${NC}" >&2
+    echo -e "  1) fast    ${CYAN}(Balanced speed – Low latency – Normal resource usage)${NC}" >&2
+    echo -e "  2) fast2   ${CYAN}(High speed – Lower latency – Moderate resource usage)${NC}" >&2
+    echo -e "  3) fast3   ${CYAN}(Maximum speed – Very low latency – High CPU usage)${NC}" >&2
+    echo -e "  4) manual  ${CYAN}(Advanced settings)${NC}" >&2
+    echo ""
+    read -p "Choose [0-4] (default: 1): " mode_choice >&2
     
     case $mode_choice in
+        0)
+            echo -e "${CYAN}Using normal mode${NC}" >&2
+            echo "" >&2
+            
+            # Ask for block cipher
+            echo -e "${YELLOW}Select encryption block cipher:${NC}" >&2
+            echo -e "  1) aes (default)" >&2
+            echo -e "  2) aes-128-gcm" >&2
+            echo -e "  3) none (no encryption)" >&2
+            echo -e "  4) Custom (enter manually)" >&2
+            read -p "Choose [1-4]: " block_choice >&2
+            
+            local block="aes"
+            case $block_choice in
+                1) block="aes" ;;
+                2) block="aes-128-gcm" ;;
+                3) block="none" ;;
+                4)
+                    read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
+                    block="${block:-aes}"
+                    ;;
+                *) block="aes" ;;
+            esac
+            
+            mode_config="    mode: \"normal\"
+    block: \"$block\""
+            ;;
         1)
             echo -e "${CYAN}Using fast mode${NC}" >&2
             echo "" >&2
@@ -486,6 +516,60 @@ get_kcp_mode_config() {
     block: \"$block\""
             ;;
         2)
+            echo -e "${CYAN}Using fast2 mode${NC}" >&2
+            echo "" >&2
+            
+            # Ask for block cipher
+            echo -e "${YELLOW}Select encryption block cipher:${NC}" >&2
+            echo -e "  1) aes (default)" >&2
+            echo -e "  2) aes-128-gcm" >&2
+            echo -e "  3) none (no encryption)" >&2
+            echo -e "  4) Custom (enter manually)" >&2
+            read -p "Choose [1-4]: " block_choice >&2
+            
+            local block="aes"
+            case $block_choice in
+                1) block="aes" ;;
+                2) block="aes-128-gcm" ;;
+                3) block="none" ;;
+                4)
+                    read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
+                    block="${block:-aes}"
+                    ;;
+                *) block="aes" ;;
+            esac
+            
+            mode_config="    mode: \"fast2\"
+    block: \"$block\""
+            ;;
+        3)
+            echo -e "${CYAN}Using fast3 mode${NC}" >&2
+            echo "" >&2
+            
+            # Ask for block cipher
+            echo -e "${YELLOW}Select encryption block cipher:${NC}" >&2
+            echo -e "  1) aes (default)" >&2
+            echo -e "  2) aes-128-gcm" >&2
+            echo -e "  3) none (no encryption)" >&2
+            echo -e "  4) Custom (enter manually)" >&2
+            read -p "Choose [1-4]: " block_choice >&2
+            
+            local block="aes"
+            case $block_choice in
+                1) block="aes" ;;
+                2) block="aes-128-gcm" ;;
+                3) block="none" ;;
+                4)
+                    read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
+                    block="${block:-aes}"
+                    ;;
+                *) block="aes" ;;
+            esac
+            
+            mode_config="    mode: \"fast3\"
+    block: \"$block\""
+            ;;
+        4)
             echo -e "${CYAN}Manual KCP configuration${NC}" >&2
             echo "" >&2
             
