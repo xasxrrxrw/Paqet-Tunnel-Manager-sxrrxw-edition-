@@ -44,6 +44,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Mana
 11. **Enter V2Ray / OpenVPN port(s)**
     Single: `555` — Multiple: `555,666,777`
 
+## Advanced Configuration (KCP Modes)
+In **Step 8 (External server)** and **Step 9 (Iran server)**, you can choose different configuration modes.
+
+### KCP Modes
+0. **normal** – Normal speed, normal latency, low resource usage  
+1. **fast** – Balanced speed, low latency, normal resource usage  
+2. **fast2** – High speed, lower latency, moderate resource usage  
+3. **fast3** – Maximum speed, very low latency, high CPU usage  
+4. **manual** – Advanced manual configuration
+
+> **Recommendation:**  
+> Based on feedback from current users, **option 1 (fast)** provides the best overall experience for most setups.
+If your **Iran server has network or resource limitations**, it is recommended to test different modes to determine which one works best for your environment.
+If you have sufficient **experience and technical knowledge**, you can use **manual mode** to fully customize all settings.
 
 ## Network Optimization (Optional)
 Run the script:
