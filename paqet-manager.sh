@@ -4,7 +4,7 @@
 # Paqet Tunnel Manager
 # Version: 3.8
 # Raw packet-level tunneling for bypassing network restrictions
-# GitHub: https://github.com/hanselime/paqet 
+# GitHub: https://github.com/hanselime/paqet
 # Design and development by: https://github.com/behzadea12 - https://t.me/behzad_developer
 #=================================================
 
