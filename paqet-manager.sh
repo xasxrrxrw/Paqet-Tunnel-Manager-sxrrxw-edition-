@@ -20,7 +20,7 @@ NC='\033[0m'
 
 # Configuration
 SCRIPT_VERSION="3.8"
-PAQET_VERSION="v1.0.0-alpha.12"
+PAQET_VERSION="v1.0.0-alpha.14"
 CONFIG_DIR="/etc/paqet"
 SERVICE_DIR="/etc/systemd/system"
 BIN_DIR="/usr/local/bin"
