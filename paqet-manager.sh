@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 5.4 (Fully Refactored)
+# Version: 6.0 (Fully Refactored)
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/behzadea12/Paqet-Tunnel-Manager
