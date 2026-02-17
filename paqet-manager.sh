@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 6.0 (Fully Refactored)
+# Version: 7.0
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/behzadea12/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="6.0"
+readonly SCRIPT_VERSION="7.0"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -133,6 +133,7 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
     ["latest"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager.sh"
+    ["6.0"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager6-0.sh"
     ["5.1"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager5-1.sh"
     ["3.8"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager3-8.sh"
 )
@@ -339,6 +340,73 @@ check_port_conflict() {
     return 0
 }
 
+normalize_host_for_compare() {
+    local host="$1"
+    host=$(echo "$host" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    host="${host#[}"; host="${host%]}"
+    case "$host" in
+        ""|"localhost"|"0.0.0.0"|"::") echo "127.0.0.1" ;;
+        *) echo "$host" ;;
+    esac
+}
+
+normalize_port() {
+    local input="$1"
+    input=$(echo "$input" | tr -cd '0-9')
+    [[ "$input" =~ ^[1-9][0-9]{0,4}$ && "$input" -le 65535 ]] && echo "$input" || echo ""
+}
+
+# ────────────────────────────────────────────────────────────────
+# Check for dangerous forward rules that point back to Paqet listener
+# Prevents traffic loop / infinite bandwidth consumption
+# ────────────────────────────────────────────────────────────────
+validate_forward_rules() {
+    # Only relevant for Port Forwarding mode
+    [[ "$traffic_type" != "1" ]] && return 0
+
+    local srv_host srv_port
+    srv_host=$(normalize_host_for_compare "$server_ip")
+    srv_port=$(normalize_port "$server_port")
+
+    [ -z "$srv_host" ] || [ -z "$srv_port" ] && return 0
+
+    echo -e "${CYAN}Checking forward rules for traffic loop prevention...${NC}"
+
+    local dangerous=0
+    IFS=',' read -ra PORTS <<< "$forward_ports"
+
+    for p in "${PORTS[@]}"; do
+        p=$(echo "$p" | tr -d '[:space:]')   # Remove whitespace
+
+        if ! validate_port "$p"; then
+            continue
+        fi
+
+        # Main case: if forward port equals server port
+        if [ "$p" = "$srv_port" ]; then
+            print_error "⚠️ TRAFFIC LOOP DETECTED!"
+            echo -e "   • Local port: ${YELLOW}$p${NC}"
+            echo -e "   • Paqet server port: ${YELLOW}$server_ip:$server_port${NC}"
+            echo -e "   This will create an infinite traffic loop and consume all bandwidth!"
+            ((dangerous++))
+        fi
+    done
+
+    if (( dangerous > 0 )); then
+        echo ""
+        print_error "❌ Configuration aborted due to loop detection."
+        echo -e "${YELLOW}Solution:${NC}"
+        echo -e "  • Change your forward ports (e.g., 443, 8443, 2053, etc.)"
+        echo -e "  • Make sure no port matches the tunnel port (${YELLOW}$server_port${NC})"
+        echo -e "  • Forward ports should point to actual services (v2ray/xray/...)"
+        pause
+        return 1
+    fi
+
+    print_success "No dangerous forward rules found ✓"
+    return 0
+}
+
 # Generate secret key
 generate_secret_key() {
     if command -v openssl &>/dev/null; then
@@ -421,6 +489,7 @@ configure_iptables() {
     done
     
     print_success "iptables configured for $protocol on port $port"
+    save_iptables
 }
 
 # Create systemd service
@@ -1207,48 +1276,55 @@ configure_server() {
         echo -e "[7/12] Encryption : ${CYAN}$block${NC}"
         
         # [8/12] pcap sockbuf
-        echo -en "${YELLOW}[8/12] pcap sockbuf [default $DEFAULT_PCAP_SOCKBUF_SERVER, 0=skip]: ${NC}"
+        echo -en "${YELLOW}[8/12] pcap sockbuf [Enter=skip, 0=skip]: ${NC}"
         read -r pcap_input
         local pcap_sockbuf=""
-        if [ -z "$pcap_input" ]; then
-            pcap_sockbuf="$DEFAULT_PCAP_SOCKBUF_SERVER"
-            echo -e "[8/12] pcap sockbuf : ${CYAN}$DEFAULT_PCAP_SOCKBUF_SERVER (default)${NC}"
-        elif [ "$pcap_input" = "0" ]; then
-            pcap_sockbuf=""
-            echo -e "[8/12] pcap sockbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$pcap_input" ] && [ "$pcap_input" != "0" ]; then
+            # فقط اگر عدد معتبر وارد کرد
+            if [[ "$pcap_input" =~ ^[0-9]+$ ]]; then
+                pcap_sockbuf="$pcap_input"
+                echo -e "[8/12] pcap sockbuf : ${CYAN}$pcap_input${NC}"
+            else
+                print_warning "Invalid number, skipping pcap sockbuf"
+                echo -e "[8/12] pcap sockbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            pcap_sockbuf="$pcap_input"
-            echo -e "[8/12] pcap sockbuf : ${CYAN}$pcap_input${NC}"
+            echo -e "[8/12] pcap sockbuf : ${CYAN}skipped${NC}"
         fi
         
         # [9/12] transport tcpbuf
-        echo -en "${YELLOW}[9/12] transport tcpbuf [default $DEFAULT_TRANSPORT_TCPBUF, 0=skip]: ${NC}"
+        echo -en "${YELLOW}[9/12] transport tcpbuf [Enter=skip, 0=skip]: ${NC}"
         read -r tcpbuf_input
         local transport_tcpbuf=""
-        if [ -z "$tcpbuf_input" ]; then
-            transport_tcpbuf="$DEFAULT_TRANSPORT_TCPBUF"
-            echo -e "[9/12] transport tcpbuf : ${CYAN}$DEFAULT_TRANSPORT_TCPBUF (default)${NC}"
-        elif [ "$tcpbuf_input" = "0" ]; then
-            transport_tcpbuf=""
-            echo -e "[9/12] transport tcpbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$tcpbuf_input" ] && [ "$tcpbuf_input" != "0" ]; then
+            if [[ "$tcpbuf_input" =~ ^[0-9]+$ ]]; then
+                transport_tcpbuf="$tcpbuf_input"
+                echo -e "[9/12] transport tcpbuf : ${CYAN}$tcpbuf_input${NC}"
+            else
+                print_warning "Invalid number, skipping transport tcpbuf"
+                echo -e "[9/12] transport tcpbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            transport_tcpbuf="$tcpbuf_input"
-            echo -e "[9/12] transport tcpbuf : ${CYAN}$tcpbuf_input${NC}"
+            echo -e "[9/12] transport tcpbuf : ${CYAN}skipped${NC}"
         fi
         
         # [10/12] transport udpbuf
-        echo -en "${YELLOW}[10/12] transport udpbuf [default $DEFAULT_TRANSPORT_UDPBUF, 0=skip]: ${NC}"
+        echo -en "${YELLOW}[10/12] transport udpbuf [Enter=skip, 0=skip]: ${NC}"
         read -r udpbuf_input
         local transport_udpbuf=""
-        if [ -z "$udpbuf_input" ]; then
-            transport_udpbuf="$DEFAULT_TRANSPORT_UDPBUF"
-            echo -e "[10/12] transport udpbuf : ${CYAN}$DEFAULT_TRANSPORT_UDPBUF (default)${NC}"
-        elif [ "$udpbuf_input" = "0" ]; then
-            transport_udpbuf=""
-            echo -e "[10/12] transport udpbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$udpbuf_input" ] && [ "$udpbuf_input" != "0" ]; then
+            if [[ "$udpbuf_input" =~ ^[0-9]+$ ]]; then
+                transport_udpbuf="$udpbuf_input"
+                echo -e "[10/12] transport udpbuf : ${CYAN}$udpbuf_input${NC}"
+            else
+                print_warning "Invalid number, skipping transport udpbuf"
+                echo -e "[10/12] transport udpbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            transport_udpbuf="$udpbuf_input"
-            echo -e "[10/12] transport udpbuf : ${CYAN}$udpbuf_input${NC}"
+            echo -e "[10/12] transport udpbuf : ${CYAN}skipped${NC}"
         fi
         
         # Apply configuration
@@ -1529,49 +1605,55 @@ configure_client() {
         block="${block:-aes-128-gcm}"
         echo -e "[8/15] Encryption : ${CYAN}$block${NC}"
         
-        # [9/15] pcap sockbuf
-        echo -en "${YELLOW}[9/15] pcap sockbuf [default $DEFAULT_PCAP_SOCKBUF_CLIENT, 0=skip]: ${NC}"
+         # [9/15] pcap sockbuf
+        echo -en "${YELLOW}[9/15] pcap sockbuf [Enter=skip, 0=skip]: ${NC}"
         read -r pcap_input
         local pcap_sockbuf=""
-        if [ -z "$pcap_input" ]; then
-            pcap_sockbuf="$DEFAULT_PCAP_SOCKBUF_CLIENT"
-            echo -e "[9/15] pcap sockbuf : ${CYAN}$DEFAULT_PCAP_SOCKBUF_CLIENT (default)${NC}"
-        elif [ "$pcap_input" = "0" ]; then
-            pcap_sockbuf=""
-            echo -e "[9/15] pcap sockbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$pcap_input" ] && [ "$pcap_input" != "0" ]; then
+            if [[ "$pcap_input" =~ ^[0-9]+$ ]]; then
+                pcap_sockbuf="$pcap_input"
+                echo -e "[9/15] pcap sockbuf : ${CYAN}$pcap_input${NC}"
+            else
+                print_warning "Invalid number, skipping pcap sockbuf"
+                echo -e "[9/15] pcap sockbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            pcap_sockbuf="$pcap_input"
-            echo -e "[9/15] pcap sockbuf : ${CYAN}$pcap_input${NC}"
+            echo -e "[9/15] pcap sockbuf : ${CYAN}skipped${NC}"
         fi
         
         # [10/15] transport tcpbuf
-        echo -en "${YELLOW}[10/15] transport tcpbuf [default $DEFAULT_TRANSPORT_TCPBUF, 0=skip]: ${NC}"
+        echo -en "${YELLOW}[10/15] transport tcpbuf [Enter=skip, 0=skip]: ${NC}"
         read -r tcpbuf_input
         local transport_tcpbuf=""
-        if [ -z "$tcpbuf_input" ]; then
-            transport_tcpbuf="$DEFAULT_TRANSPORT_TCPBUF"
-            echo -e "[10/15] transport tcpbuf : ${CYAN}$DEFAULT_TRANSPORT_TCPBUF (default)${NC}"
-        elif [ "$tcpbuf_input" = "0" ]; then
-            transport_tcpbuf=""
-            echo -e "[10/15] transport tcpbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$tcpbuf_input" ] && [ "$tcpbuf_input" != "0" ]; then
+            if [[ "$tcpbuf_input" =~ ^[0-9]+$ ]]; then
+                transport_tcpbuf="$tcpbuf_input"
+                echo -e "[10/15] transport tcpbuf : ${CYAN}$tcpbuf_input${NC}"
+            else
+                print_warning "Invalid number, skipping transport tcpbuf"
+                echo -e "[10/15] transport tcpbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            transport_tcpbuf="$tcpbuf_input"
-            echo -e "[10/15] transport tcpbuf : ${CYAN}$tcpbuf_input${NC}"
+            echo -e "[10/15] transport tcpbuf : ${CYAN}skipped${NC}"
         fi
         
         # [11/15] transport udpbuf
-        echo -en "${YELLOW}[11/15] transport udpbuf [default $DEFAULT_TRANSPORT_UDPBUF, 0=skip]: ${NC}"
+        echo -en "${YELLOW}[11/15] transport udpbuf [Enter=skip, 0=skip]: ${NC}"
         read -r udpbuf_input
         local transport_udpbuf=""
-        if [ -z "$udpbuf_input" ]; then
-            transport_udpbuf="$DEFAULT_TRANSPORT_UDPBUF"
-            echo -e "[11/15] transport udpbuf : ${CYAN}$DEFAULT_TRANSPORT_UDPBUF (default)${NC}"
-        elif [ "$udpbuf_input" = "0" ]; then
-            transport_udpbuf=""
-            echo -e "[11/15] transport udpbuf : ${CYAN}- (skipped)${NC}"
+        
+        if [ -n "$udpbuf_input" ] && [ "$udpbuf_input" != "0" ]; then
+            if [[ "$udpbuf_input" =~ ^[0-9]+$ ]]; then
+                transport_udpbuf="$udpbuf_input"
+                echo -e "[11/15] transport udpbuf : ${CYAN}$udpbuf_input${NC}"
+            else
+                print_warning "Invalid number, skipping transport udpbuf"
+                echo -e "[11/15] transport udpbuf : ${CYAN}skipped${NC}"
+            fi
         else
-            transport_udpbuf="$udpbuf_input"
-            echo -e "[11/15] transport udpbuf : ${CYAN}$udpbuf_input${NC}"
+            echo -e "[11/15] transport udpbuf : ${CYAN}skipped${NC}"
         fi
         
         # [12/15] Traffic Type
@@ -1690,7 +1772,19 @@ configure_client() {
                 continue
                 ;;
         esac
-        
+
+        if [[ "$traffic_type" == "1" ]]; then
+            if ! validate_forward_rules; then
+                echo -e "\n${RED}⚠️  TRAFFIC LOOP DETECTED!${NC}"
+                echo -e "  • Server endpoint: $server_ip:$server_port"
+                echo -e "  • Forward ports: $forward_ports"
+                echo -e "${YELLOW}Make sure none of the forward ports match the server port.${NC}"
+                echo -e "${YELLOW}Forward ports should point to your actual services (V2Ray, web servers, etc.), not the Paqet tunnel.${NC}"
+                pause
+                continue
+            fi
+        fi
+
         # Apply configuration
         echo -e "\n${CYAN}Applying Configuration${NC}"
         echo -e "────────────────────────────────────────────────────────────────"
@@ -2240,24 +2334,96 @@ install_dependencies() {
     
     case $os in
         ubuntu|debian)
+            print_info "Updating package lists..."
             apt update -qq >/dev/null 2>&1 || true
+            
+            print_info "Installing base packages..."
             apt install -y curl wget libpcap-dev iptables lsof iproute2 cron dnsutils >/dev/null 2>&1 || {
-                print_warning "Some packages may have failed to install"
+                print_warning "Some base packages may have failed to install"
             }
+            
+            # Install iptables persistence
+            install_iptables_persistent
             ;;
+            
         centos|rhel|fedora|rocky|almalinux)
+            print_info "Installing base packages..."
             yum install -y curl wget libpcap-devel iptables lsof iproute cronie bind-utils >/dev/null 2>&1 || {
-                print_warning "Some packages may have failed to install"
+                print_warning "Some base packages may have failed to install"
             }
+            
+            # Install iptables persistence
+            install_iptables_persistent
             ;;
+            
         *)
             print_warning "Unknown OS. Please install manually: libpcap iptables curl cron dnsutils"
+            print_warning "Also ensure iptables rules persist after reboot on your system"
             ;;
     esac
     
-    print_success "Dependencies installed"
+    print_success "Dependency installation completed"
     pause
     return
+}
+
+# ================================================
+# IPTABLES PERSISTENCE FUNCTIONS
+# ================================================
+
+install_iptables_persistent() {
+    print_step "Installing iptables persistence..."
+    local os=$(detect_os)
+    case $os in
+        ubuntu|debian)
+            if dpkg -l | grep -q "iptables-persistent"; then
+                print_success "iptables-persistent is already installed"
+            else
+                print_info "Installing iptables-persistent (non-interactive)..."
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq >/dev/null 2>&1
+                apt-get install -y iptables-persistent >/dev/null 2>&1
+                
+                if [ $? -eq 0 ]; then
+                    print_success "iptables-persistent installed successfully"
+                    save_iptables
+                else
+                    print_warning "Failed to install iptables-persistent"
+                    print_info "iptables rules will NOT persist after reboot unless you install it manually"
+                fi
+            fi
+            ;;
+            
+        centos|rhel|fedora|rocky|almalinux)
+            local pkg="iptables-services"
+            if ! rpm -q "$pkg" >/dev/null 2>&1; then
+                print_info "Installing $pkg..."
+                if command -v yum >/dev/null 2>&1; then
+                    yum install -y "$pkg" >/dev/null 2>&1
+                elif command -v dnf >/dev/null 2>&1; then
+                    dnf install -y "$pkg" >/dev/null 2>&1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    print_success "$pkg installed"
+                    systemctl enable iptables >/dev/null 2>&1
+                    save_iptables
+                else
+                    print_warning "Failed to install $pkg"
+                fi
+            else
+                print_success "$pkg is already installed"
+            fi
+            ;;
+            
+        *)
+            print_warning "Unknown OS - iptables persistence may require manual setup"
+            print_info "Please install iptables-persistent (Debian/Ubuntu) or iptables-services (RHEL-based)"
+            ;;
+    esac
+    
+    # Final save attempt in all cases
+    save_iptables
 }
 
 # Install Paqet binary
@@ -3129,14 +3295,12 @@ optimize_server() {
 # ================================================
 # MANAGE ALL SERVICES
 # ================================================
-
-# Manage all services (Restart, Live Log, Delete)
 manage_all_services() {
     while true; do
         clear
         show_banner
         echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║ Manage All Paqet Services                                    ║${NC}"
+        echo -e "${GREEN}║                 Manage All Paqet Services                    ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
         
         local services=()
@@ -3170,156 +3334,1368 @@ manage_all_services() {
             ((i++))
         done
         
-        echo -e "\n${YELLOW}Management Options:${NC}"
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}🔒 CONNECTION PROTECTION${NC}"
         echo -e "────────────────────────────────────────────────────────────────"
-        echo -e " ${GREEN}[1]${NC} 🔄 Restart All Services"
-        echo -e " ${GREEN}[2]${NC} 📋 Live Log Monitoring (All Tunnels)"
-        echo -e " ${GREEN}[3]${NC} 🗑️  Delete All Tunnels"
+        echo -e " ${GREEN}[1]${NC} 🛡️ Apply Connection Protection (Anti-RST + NOTRACK | Recommended)"
+        echo -e " ${GREEN}[2]${NC} ❌ Remove Protection Rules"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}🔄 NAT PORT FORWARDING${NC}"
+        echo -e "────────────────────────────────────────────────────────────────"
+        echo -e " ${GREEN}[3]${NC} 🌐 Multi-Port Forward (specific ports)"
+        echo -e " ${GREEN}[4]${NC} 🌍 All-Ports Forward (except excluded)"
+        echo -e " ${GREEN}[5]${NC} 📋 View NAT Rules"
+        echo -e " ${GREEN}[6]${NC} 🗑️ Remove Forwarding by Destination IP"
+        echo -e " ${GREEN}[7]${NC} 💣 Flush All NAT Rules"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}🚀 SERVICE CONTROL${NC}"
+        echo -e "────────────────────────────────────────────────────────────────"
+        echo -e " ${GREEN}[8]${NC} ▶️  Start All Services"
+        echo -e " ${GREEN}[9]${NC} ⏹️  Stop All Services"
+        echo -e " ${GREEN}[10]${NC} 🔄 Restart All Services"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}📊 MONITORING & DIAGNOSTICS${NC}"
+        echo -e "────────────────────────────────────────────────────────────────"
+        echo -e " ${GREEN}[11]${NC} 📋 Live Log Monitoring (All Services)"
+        echo -e " ${GREEN}[12]${NC} 📊 Test MTU / Packet Loss"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}⚙️  BULK CONFIGURATION${NC}"
+        echo -e "────────────────────────────────────────────────────────────────"
+        echo -e " ${GREEN}[13]${NC} 🔧 Change Mode All Services"
+        echo -e " ${GREEN}[14]${NC} 🔌 Change Connections All Services"
+        echo -e " ${GREEN}[15]${NC} 📦 Change MTU All Services"
+        echo -e " ${GREEN}[16]${NC} 🔒 Change Block All Services"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e " ${GREEN}[17]${NC} 🗑️  Delete All Tunnels"
         echo -e " ${GREEN}[0]${NC} ↩️ Back to Main Menu"
         echo ""
         
-        read -p "Choose option [0-3]: " mgmt_choice
+        read -p "Choose option [0-17]: " mgmt_choice
         
         case $mgmt_choice in
-            1)
-                # Restart All Services
-                echo -e "\n${YELLOW}Restarting all Paqet services...${NC}"
-                
-                local success_count=0
-                local fail_count=0
-                
-                for svc in "${services[@]}"; do
-                    local service_name="${svc%.service}"
-                    local display_name="${service_name#paqet-}"
-                    
-                    echo -n " Restarting $display_name... "
-                    
-                    if systemctl restart "$svc" >/dev/null 2>&1; then
-                        sleep 1
-                        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-                            echo -e "${GREEN}✅ SUCCESS${NC}"
-                            ((success_count++))
-                        else
-                            echo -e "${RED}❌ FAILED (not running)${NC}"
-                            ((fail_count++))
-                        fi
-                    else
-                        echo -e "${RED}❌ FAILED${NC}"
-                        ((fail_count++))
-                    fi
-                done
-                
-                echo -e "\n${CYAN}Results:${NC}"
-                echo -e " ${GREEN}✅ Success:${NC} $success_count service(s)"
-                echo -e " ${RED}❌ Failed:${NC} $fail_count service(s)"
-                
-                if [ $fail_count -eq 0 ]; then
-                    print_success "All services restarted successfully!"
-                elif [ $success_count -eq 0 ]; then
-                    print_error "All services failed to restart!"
-                else
-                    print_warning "Some services failed to restart"
-                fi
-                pause
-                ;;
-                
-            2)
-                # Live Log Monitoring
-                echo -e "\n${YELLOW}Live Log Monitoring - All Paqet Tunnels${NC}"
-                echo -e "────────────────────────────────────────────────────────────────"
-                echo -e "${CYAN}Showing logs from all paqet services (Ctrl+C to exit)${NC}\n"
-                sleep 2
-                
-                # Build journalctl command for all paqet services
-                local journal_args=""
-                for svc in "${services[@]}"; do
-                    journal_args="$journal_args -u $svc"
-                done
-                
-                # Follow logs from all services
-                journalctl $journal_args -f --output=short-iso
-                
-                # After exiting journalctl
-                echo -e "\n${YELLOW}Returned from log monitoring${NC}"
-                pause
-                ;;
-                
-            3)
-                # Delete All Tunnels
-              echo -e "\n${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${RED}║                          WARNING!                            ║${NC}"
-                echo -e "${RED}║    This will delete ALL Paqet tunnels and configurations!    ║${NC}"
-                echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}\n"
-                
-                echo -e "${YELLOW}Services to be deleted:${NC}"
-                for svc in "${services[@]}"; do
-                    local service_name="${svc%.service}"
-                    local display_name="${service_name#paqet-}"
-                    echo -e " - ${CYAN}$display_name${NC}"
-                done
-                
-                echo ""
-                read -p "Are you ABSOLUTELY SURE? (type 'yes' to confirm): " confirm
-                
-                if [ "$confirm" != "yes" ]; then
-                    echo -e "${YELLOW}Operation cancelled.${NC}"
-                    pause
-                    continue
-                fi
-                
-                echo ""
-                print_step "Stopping and removing all services..."
-                
-                local deleted_count=0
-                local failed_count=0
-                
-                for svc in "${services[@]}"; do
-                    local service_name="${svc%.service}"
-                    local display_name="${service_name#paqet-}"
-                    local config_file="$CONFIG_DIR/$display_name.yaml"
-                    
-                    echo -n " Removing $display_name... "
-                    
-                    # Remove cronjob
-                    remove_cronjob "$service_name" >/dev/null 2>&1 || true
-                    
-                    # Stop and disable service
-                    systemctl stop "$svc" >/dev/null 2>&1 || true
-                    systemctl disable "$svc" >/dev/null 2>&1 || true
-                    
-                    # Remove service file
-                    if [ -f "$SERVICE_DIR/$svc" ]; then
-                        rm -f "$SERVICE_DIR/$svc" >/dev/null 2>&1 || true
-                    fi
-                    
-                    # Remove config file
-                    if [ -f "$config_file" ]; then
-                        rm -f "$config_file" >/dev/null 2>&1 || true
-                    fi
-                    
-                    echo -e "${GREEN}✅ Removed${NC}"
-                    ((deleted_count++))
-                done
-                
-                systemctl daemon-reload >/dev/null 2>&1
-                
-                echo -e "\n${CYAN}Results:${NC}"
-                echo -e " ${GREEN}✅ Deleted:${NC} $deleted_count service(s)"
-                
-                print_success "All tunnels deleted successfully!"
-                pause
-                ;;
-                
-            0)
-                return
-                ;;
-                
-            *)
-                print_error "Invalid choice"
-                sleep 1.5
-                ;;
+            1) apply_connection_protection ;;
+            2) remove_connection_protection ;;
+            3) add_nat_forward_multi_port ;;
+            4) add_nat_forward_all_ports ;;
+            5) view_nat_rules ;;
+            6) remove_nat_forward_by_dest ;;
+            7) flush_nat_rules ;;
+            8) start_all_services "${services[@]}" ;;
+            9) stop_all_services "${services[@]}" ;;
+            10) restart_all_services "${services[@]}" ;;
+            11) live_log_all_services "${services[@]}" ;;
+            12) test_mtu ;;
+            13) change_mode_all_services ;;
+            14) change_conn_all_services ;;
+            15) set_global_mtu ;;
+            16) change_block_all_services ;;
+            17) delete_all_tunnels "${services[@]}" ;;
+            0) return ;;
+            *) print_error "Invalid choice"; sleep 1.5 ;;
         esac
     done
+}
+
+# ================================================
+# BULK CONFIGURATION FUNCTIONS
+# ================================================
+
+start_all_services() {
+    local services=("$@")
+    echo -e "\n${YELLOW}Starting all Paqet services...${NC}"
+    
+    local success_count=0
+    local fail_count=0
+    
+    for svc in "${services[@]}"; do
+        local service_name="${svc%.service}"
+        local display_name="${service_name#paqet-}"
+        
+        echo -n " Starting $display_name... "
+        
+        if systemctl start "$svc" >/dev/null 2>&1; then
+            sleep 1
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                echo -e "${GREEN}✅ SUCCESS${NC}"
+                ((success_count++))
+            else
+                echo -e "${RED}❌ FAILED (not running)${NC}"
+                ((fail_count++))
+            fi
+        else
+            echo -e "${RED}❌ FAILED${NC}"
+            ((fail_count++))
+        fi
+    done
+    
+    echo -e "\n${CYAN}Results:${NC}"
+    echo -e " ${GREEN}✅ Success:${NC} $success_count service(s)"
+    echo -e " ${RED}❌ Failed:${NC} $fail_count service(s)"
+    pause
+}
+
+stop_all_services() {
+    local services=("$@")
+    echo -e "\n${YELLOW}Stopping all Paqet services...${NC}"
+    
+    local success_count=0
+    local fail_count=0
+    
+    for svc in "${services[@]}"; do
+        local service_name="${svc%.service}"
+        local display_name="${service_name#paqet-}"
+        
+        echo -n " Stopping $display_name... "
+        
+        if systemctl stop "$svc" >/dev/null 2>&1; then
+            sleep 1
+            if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+                echo -e "${GREEN}✅ SUCCESS${NC}"
+                ((success_count++))
+            else
+                echo -e "${RED}❌ FAILED (still running)${NC}"
+                ((fail_count++))
+            fi
+        else
+            echo -e "${RED}❌ FAILED${NC}"
+            ((fail_count++))
+        fi
+    done
+    
+    echo -e "\n${CYAN}Results:${NC}"
+    echo -e " ${GREEN}✅ Success:${NC} $success_count service(s)"
+    echo -e " ${RED}❌ Failed:${NC} $fail_count service(s)"
+    pause
+}
+
+change_mode_all_services() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Change KCP Mode for ALL Services${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    echo -e "${CYAN}Available KCP Modes:${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    echo -e " ${GREEN}[1]${NC} normal  - Normal speed / Normal latency / Low usage"
+    echo -e " ${GREEN}[2]${NC} fast    - Balanced speed / Low latency / Normal usage"
+    echo -e " ${GREEN}[3]${NC} fast2   - High speed / Lower latency / Medium usage"
+    echo -e " ${GREEN}[4]${NC} fast3   - Max speed / Very low latency / High CPU"
+    echo -e " ${GREEN}[5]${NC} manual  - Advanced settings"
+    echo ""
+    
+    read -p "Select new mode [1-5]: " mode_choice
+    
+    local new_mode=""
+    case $mode_choice in
+        1) new_mode="normal" ;;
+        2) new_mode="fast" ;;
+        3) new_mode="fast2" ;;
+        4) new_mode="fast3" ;;
+        5) 
+            echo -e "\n${YELLOW}Manual mode requires individual configuration.${NC}"
+            echo -e "${YELLOW}Please configure each service separately.${NC}"
+            pause
+            return
+            ;;
+        *) print_error "Invalid choice"; return ;;
+    esac
+    
+    echo -e "\n${YELLOW}Applying mode '$new_mode' to all configurations...${NC}"
+    
+    local configs=()
+    while IFS= read -r -d '' file; do
+        configs+=("$file")
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    local modified=0
+    for config in "${configs[@]}"; do
+        local config_name=$(basename "$config" .yaml)
+        
+        if grep -q "mode:" "$config"; then
+            sed -i "s/mode:.*/mode: \"$new_mode\"/" "$config"
+            echo -e " ${GREEN}✓${NC} Updated $config_name"
+            ((modified++))
+        else
+            if grep -q "kcp:" "$config"; then
+                sed -i "/kcp:/a \    mode: \"$new_mode\"" "$config"
+                echo -e " ${GREEN}✓${NC} Added mode to $config_name"
+                ((modified++))
+            fi
+        fi
+    done
+    
+    echo -e "\n${GREEN}✅ Mode set to '$new_mode' on $modified configuration(s)${NC}"
+    
+    read -p "Restart all services to apply changes? (y/N): " restart_choice
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        local services=()
+        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                              grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+        restart_all_services "${services[@]}"
+    fi
+    
+    pause
+}
+
+change_conn_all_services() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Change Connections Count for ALL Services${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${CYAN}Current connections per service:${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    
+    local configs=()
+    while IFS= read -r -d '' file; do
+        configs+=("$file")
+        local config_name=$(basename "$file" .yaml)
+        local current_conn=$(grep "^conn:" "$file" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+        echo -e " ${config_name}: ${current_conn:-Not set (using default: $DEFAULT_CONNECTIONS)}"
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    echo -e "\n${CYAN}Enter new connections value [1-32]:${NC}"
+    read -p "New connections count: " new_conn
+    
+    if ! [[ "$new_conn" =~ ^[1-9][0-9]?$ ]] || [ "$new_conn" -lt 1 ] || [ "$new_conn" -gt 32 ]; then
+        print_error "Invalid value. Must be between 1 and 32"
+        pause
+        return
+    fi
+    
+    echo -e "\n${YELLOW}Applying connections=$new_conn to all configurations...${NC}"
+    
+    local modified=0
+    for config in "${configs[@]}"; do
+        local config_name=$(basename "$config" .yaml)
+        
+        if grep -q "^conn:" "$config"; then
+            sed -i "s/^conn:.*/conn: $new_conn/" "$config"
+            echo -e " ${GREEN}✓${NC} Updated $config_name"
+            ((modified++))
+        else
+            # Add under transport section
+            if grep -q "transport:" "$config"; then
+                sed -i "/transport:/a \  conn: $new_conn" "$config"
+                echo -e " ${GREEN}✓${NC} Added conn to $config_name"
+                ((modified++))
+            fi
+        fi
+    done
+    
+    echo -e "\n${GREEN}✅ Connections set to $new_conn on $modified configuration(s)${NC}"
+    
+    read -p "Restart all services to apply changes? (y/N): " restart_choice
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        local services=()
+        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                              grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+        restart_all_services "${services[@]}"
+    fi
+    
+    pause
+}
+
+change_block_all_services() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Change Block/Encryption for ALL Services${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${CYAN}Available Encryption Options:${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    echo -e " ${GREEN}[1]${NC} aes-128-gcm - Very high security / Very fast / Recommended"
+    echo -e " ${GREEN}[2]${NC} aes         - High security / Medium speed / General use"
+    echo -e " ${GREEN}[3]${NC} aes-128     - High security / Fast / Low CPU usage"
+    echo -e " ${GREEN}[4]${NC} aes-192     - Very high security / Medium speed / Moderate CPU"
+    echo -e " ${GREEN}[5]${NC} aes-256     - Maximum security / Slower / Higher CPU"
+    echo -e " ${GREEN}[6]${NC} none        - No encryption / Max speed / Insecure"
+    echo -e " ${GREEN}[7]${NC} null        - No encryption / Max speed / Insecure"
+    echo ""
+    
+    read -p "Select encryption [1-7]: " enc_choice
+    
+    local new_block=""
+    case $enc_choice in
+        1) new_block="aes-128-gcm" ;;
+        2) new_block="aes" ;;
+        3) new_block="aes-128" ;;
+        4) new_block="aes-192" ;;
+        5) new_block="aes-256" ;;
+        6) new_block="none" ;;
+        7) new_block="null" ;;
+        *) print_error "Invalid choice"; return ;;
+    esac
+    
+    echo -e "\n${YELLOW}Applying block='$new_block' to all configurations...${NC}"
+    
+    local configs=()
+    while IFS= read -r -d '' file; do
+        configs+=("$file")
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    local modified=0
+    for config in "${configs[@]}"; do
+        local config_name=$(basename "$config" .yaml)
+        
+        if grep -q "block:" "$config"; then
+            sed -i "s/block:.*/block: \"$new_block\"/" "$config"
+            echo -e " ${GREEN}✓${NC} Updated $config_name"
+            ((modified++))
+        else
+            if grep -q "kcp:" "$config"; then
+                sed -i "/kcp:/a \    block: \"$new_block\"" "$config"
+                echo -e " ${GREEN}✓${NC} Added block to $config_name"
+                ((modified++))
+            fi
+        fi
+    done
+    
+    echo -e "\n${GREEN}✅ Block/Encryption set to '$new_block' on $modified configuration(s)${NC}"
+    
+    read -p "Restart all services to apply changes? (y/N): " restart_choice
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        local services=()
+        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                              grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+        restart_all_services "${services[@]}"
+    fi
+    
+    pause
+}
+
+# ================================================
+# CONNECTION PROTECTION FUNCTIONS
+# ================================================
+apply_connection_protection() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Apply Connection Protection (Anti-RST + NOTRACK)${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    print_step "Scanning active Paqet configurations..."
+    
+    local configs=()
+    while IFS= read -r -d '' file; do
+        configs+=("$file")
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        print_warning "No Paqet configuration files found in $CONFIG_DIR"
+        pause
+        return 1
+    fi
+    
+    echo -e "${CYAN}Found ${#configs[@]} configuration(s)${NC}\n"
+    
+    local server_protected=0
+    local client_protected=0
+    local rules_added=0
+    local rules_skipped=0
+    
+    for config in "${configs[@]}"; do
+        local config_name=$(basename "$config" .yaml)
+        local role=$(grep "^role:" "$config" | awk '{print $2}' | tr -d '"' 2>/dev/null)
+        
+        echo -n "  Processing $config_name (${role:-unknown})... "
+        
+        if [[ "$role" != "server" && "$role" != "client" ]]; then
+            echo -e "${YELLOW}skipped (unknown role)${NC}"
+            continue
+        fi
+        
+        if [ "$role" = "server" ]; then
+            # Server: extract listen port
+            local port=$(grep -A5 "listen:" "$config" | grep "addr:" | \
+                         sed -n 's/.*:\([0-9]*\)".*/\1/p' | head -1 | tr -d ' ')
+            
+            if ! validate_port "$port"; then
+                echo -e "${YELLOW}⚠ No valid port found${NC}"
+                continue
+            fi
+            
+            # Apply protection rules (check before add)
+            local added=0
+            
+            iptables -t raw -C PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null || {
+                iptables -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
+                ((added++))
+            }
+            iptables -t raw -C OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null || {
+                iptables -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
+                ((added++))
+            }
+            iptables -t mangle -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+                ((added++))
+            }
+            iptables -t mangle -C PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+                ((added++))
+            }
+            
+            if [ $added -gt 0 ]; then
+                echo -e "${GREEN}✓ Protected (port $port, $added new rules)${NC}"
+                ((rules_added += added))
+                ((server_protected++))
+            else
+                echo -e "${CYAN}already protected${NC}"
+                ((rules_skipped++))
+            fi
+            
+        elif [ "$role" = "client" ]; then
+            # Client: extract server addr
+            local server=$(grep -A2 "server:" "$config" | grep "addr:" | \
+                           awk '{print $2}' | tr -d '"' | head -1)
+            
+            if [[ -z "$server" || ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+                echo -e "${YELLOW}⚠ Invalid or missing server address${NC}"
+                continue
+            fi
+            
+            local sip=$(echo "$server" | cut -d: -f1)
+            local sport=$(echo "$server" | cut -d: -f2)
+            
+            if ! validate_ip "$sip" || ! validate_port "$sport"; then
+                echo -e "${YELLOW}⚠ Invalid server address: $server${NC}"
+                continue
+            fi
+            
+            # Apply client-side protection
+            local added=0
+            
+            iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || {
+                iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
+                ((added++))
+            }
+            iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || {
+                iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
+                ((added++))
+            }
+            iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
+                ((added++))
+            }
+            iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP
+                ((added++))
+            }
+            
+            if [ $added -gt 0 ]; then
+                echo -e "${GREEN}✓ Protected (server $sip:$sport, $added new rules)${NC}"
+                ((rules_added += added))
+                ((client_protected++))
+            else
+                echo -e "${CYAN}already protected${NC}"
+                ((rules_skipped++))
+            fi
+        fi
+    done
+    
+    echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}Protection Summary:${NC}"
+    echo -e " ${GREEN}✓${NC} Servers protected: $server_protected"
+    echo -e " ${GREEN}✓${NC} Clients protected: $client_protected"
+    echo -e " ${GREEN}✓${NC} New iptables rules added: $rules_added"
+    echo -e " ${CYAN}i${NC} Rules already existed (skipped): $rules_skipped"
+    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    
+    # Save rules persistently
+    if command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables 2>/dev/null
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null && \
+            print_success "Iptables rules saved to /etc/iptables/rules.v4"
+        
+        # Try netfilter-persistent if installed
+        if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save 2>/dev/null && \
+                print_success "Rules saved via netfilter-persistent"
+        fi
+    else
+        print_warning "iptables-save not found - rules not persisted after reboot"
+    fi
+    
+    save_iptables
+
+    echo ""
+    read -p "Restart all Paqet services now? (y/N): " restart_choice
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        local services=()
+        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                              grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+        
+        for svc in "${services[@]}"; do
+            systemctl restart "$svc" 2>/dev/null && \
+                echo -e "  Restarted: ${CYAN}${svc%.service}${NC}"
+        done
+        
+        if [[ ${#services[@]} -gt 0 ]]; then
+            print_success "All Paqet services restarted"
+        else
+            print_info "No Paqet services found to restart"
+        fi
+    fi
+    
+    pause
+    return 0
+}
+remove_connection_protection() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Remove Connection Protection Rules${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    print_warning "This will remove all Paqet-related iptables protection rules."
+    echo ""
+    read -p "Are you sure? (y/N): " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        print_info "Operation cancelled"
+        pause
+        return
+    fi
+    
+    local rules_removed=0
+    
+    # Find and remove all Paqet-related rules
+    # Method 1: Remove rules based on port ranges (common paqet ports)
+    for table in raw mangle; do
+        # Get all rules in the table
+        while IFS= read -r rule; do
+            if [[ "$rule" == *"paqet"* ]] || [[ "$rule" == *"NOTRACK"* ]] || [[ "$rule" == *"RST"* ]]; then
+                # This is a simplistic approach - better to track specific rules
+                iptables -t "$table" -F 2>/dev/null && ((rules_removed+=10))
+                break
+            fi
+        done < <(iptables -t "$table" -L 2>/dev/null | head -20)
+    done
+    
+    # More precise: Flush only specific chains if we want to be careful
+    iptables -t raw -F 2>/dev/null && ((rules_removed+=5))
+    iptables -t mangle -F 2>/dev/null && ((rules_removed+=5))
+    
+    print_success "Removed protection rules (approx $rules_removed rules flushed)"
+    
+    # Save iptables rules (now empty)
+    if command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+        iptables-save > /etc/iptables.up.rules 2>/dev/null || true
+        print_success "Iptables rules saved (protection removed)"
+    fi
+    
+    pause
+}
+
+# ================================================
+# MTU MANAGEMENT FUNCTIONS
+# ================================================
+
+set_global_mtu() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Set Global MTU for ALL Paqet Tunnels${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${CYAN}MTU Recommendations:${NC}"
+    echo -e " • 1500: Default Ethernet (may be detected/fragmented)"
+    echo -e " • 1400: Good balance for most connections"
+    echo -e " • 1350: Recommended for Iran (avoids fragmentation)"
+    echo -e " • 1300: More stable in restricted networks"
+    echo -e " • 1280: IPv6 minimum MTU (very stable)"
+    echo -e " • 1200: Ultra stable for heavily filtered connections"
+    echo ""
+    
+    local current_mtu=""
+    local configs=()
+    while IFS= read -r -d '' file; do
+        configs+=("$file")
+        # Try to get current MTU from first config
+        if [ -z "$current_mtu" ]; then
+            current_mtu=$(grep "mtu:" "$file" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+        fi
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        print_warning "No configuration files found in $CONFIG_DIR"
+        pause
+        return
+    fi
+    
+    echo -e "${YELLOW}Current MTU:${NC} ${current_mtu:-Not set (using default)}"
+    echo -e "${YELLOW}Total configs:${NC} ${#configs[@]}\n"
+    
+    local new_mtu=""
+    while true; do
+        read -p "Enter new MTU [1000-1500] (recommend 1280-1350): " input_mtu
+        
+        if [ -z "$input_mtu" ]; then
+            print_error "MTU cannot be empty"
+            continue
+        fi
+        
+        if [[ "$input_mtu" =~ ^[0-9]+$ ]] && [ "$input_mtu" -ge 1000 ] && [ "$input_mtu" -le 1500 ]; then
+            new_mtu="$input_mtu"
+            break
+        else
+            print_error "Invalid MTU. Must be between 1000 and 1500"
+        fi
+    done
+    
+    echo -e "\n${YELLOW}Applying MTU $new_mtu to all configurations...${NC}"
+    
+    local modified=0
+    for config in "${configs[@]}"; do
+        local config_name=$(basename "$config" .yaml)
+        
+        # Check if file has mtu setting
+        if grep -q "mtu:" "$config"; then
+            # Update existing mtu
+            sed -i "s/mtu:.*/mtu: $new_mtu/" "$config"
+            echo -e " ${GREEN}✓${NC} Updated $config_name"
+        else
+            # Add mtu under kcp section
+            if grep -q "kcp:" "$config"; then
+                # Find kcp section and add mtu after it with proper indentation
+                sed -i "/kcp:/a\    mtu: $new_mtu" "$config"
+                echo -e " ${GREEN}✓${NC} Added mtu to $config_name"
+            else
+                # No kcp section? Add it at the end
+                echo "" >> "$config"
+                echo "transport:" >> "$config"
+                echo "  kcp:" >> "$config"
+                echo "    mtu: $new_mtu" >> "$config"
+                echo -e " ${YELLOW}⚠${NC} Created kcp section in $config_name"
+            fi
+        fi
+        ((modified++))
+    done
+    
+    echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}✅ MTU set to $new_mtu on $modified configuration(s)${NC}"
+    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${YELLOW}Note: Changes are saved to config files but services are not restarted.${NC}"
+    read -p "Restart all services now to apply changes? (y/N): " restart_choice
+    
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        restart_all_services "${services[@]}"
+    fi
+    
+    pause
+}
+
+test_mtu() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}MTU / Packet Loss Test${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"    
+    echo -e "${CYAN}This test checks different MTU sizes against target servers.${NC}"
+    echo -e "${CYAN}Smaller MTUs are more stable but slightly slower.${NC}\n"
+
+    local client_configs=()
+    local server_ips=()
+    local server_names=()
+
+    while IFS= read -r -d '' file; do
+        if grep -q "role:.*client" "$file" 2>/dev/null; then
+            client_configs+=("$file")
+            local config_name=$(basename "$file" .yaml)
+            local server_line=$(grep -A2 "server:" "$file" | grep "addr:" | head -1)
+            local server=$(echo "$server_line" | awk '{print $2}' | tr -d '"')
+            
+            if [ -n "$server" ]; then
+                local sip=$(echo "$server" | cut -d: -f1)
+                if validate_ip "$sip"; then
+                    server_ips+=("$sip")
+                    server_names+=("$config_name → $sip")
+                fi
+            fi
+        fi
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+
+    echo -e "${YELLOW}Select test target:${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    
+    local menu_options=()
+    local i=1
+
+    echo -e " ${GREEN}[$i]${NC} Manual IP entry"
+    menu_options+=("manual")
+    ((i++))
+    
+    if [ ${#server_names[@]} -gt 0 ]; then
+        echo -e "\n${CYAN}Detected client configurations:${NC}"
+        for idx in "${!server_names[@]}"; do
+            echo -e " ${GREEN}[$i]${NC} ${server_names[$idx]}"
+            menu_options+=("client_$idx")
+            ((i++))
+        done
+    fi
+
+    echo -e "\n ${GREEN}[0]${NC} ↩️ Back"
+    echo ""
+    
+    local target_ip=""
+    local choice
+    read -p "Choose option [0-$((i-1))]: " choice
+    
+    [ "$choice" = "0" ] && return
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -ge "$i" ]; then
+        print_error "Invalid choice"
+        pause
+        return
+    fi
+    
+    local selected="${menu_options[$((choice-1))]}"
+    
+    case "$selected" in
+        "manual")
+            echo -en "\n${YELLOW}Enter target IP address: ${NC}"
+            read -r manual_ip
+            manual_ip=$(echo "$manual_ip" | tr -d ' ')
+            if validate_ip "$manual_ip"; then
+                target_ip="$manual_ip"
+                run_mtu_test "$target_ip" "Manual target: $manual_ip"
+            else
+                print_error "Invalid IP address"
+                pause
+                return
+            fi
+            ;;
+        *)
+            # Client selection
+            if [[ "$selected" =~ ^client_([0-9]+)$ ]]; then
+                local client_idx="${BASH_REMATCH[1]}"
+                target_ip="${server_ips[$client_idx]}"
+                run_mtu_test "$target_ip" "${server_names[$client_idx]}"
+            fi
+            ;;
+    esac
+    pause
+}
+
+run_mtu_test() {
+    local target_ip="$1"
+    local target_name="$2"
+    local silent_mode="${3:-normal}"
+
+    if [[ "$target_ip" == *":"* ]]; then
+        target_ip=$(echo "$target_ip" | cut -d: -f1)
+    fi
+    
+    if [ "$silent_mode" = "normal" ]; then
+        clear
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}MTU Test for: $target_name${NC}"
+        echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    fi
+    
+    local test_results=()
+    local best_mtu=""
+    local best_loss=100
+    local best_ping=""
+    
+    echo -e "${CYAN}┌──────────┬──────────────┬─────────────┬──────────────┬─────────────────┐${NC}"
+    echo -e "${CYAN}│ MTU Size │ Payload Size │ Packet Loss │   Ping (ms)  │     Status      │${NC}"
+    echo -e "${CYAN}├──────────┼──────────────┼─────────────┼──────────────┼─────────────────┤${NC}"
+    
+    local test_sizes=(
+        "1472:1500"
+        "1400:1428"
+        "1350:1378"
+        "1300:1328"
+        "1280:1308"
+        "1200:1228"
+        "1100:1128"
+        "1000:1028"
+    )
+    
+    for test in "${test_sizes[@]}"; do
+        local payload="${test%%:*}"
+        local mtu="${test##*:}"
+        local ping_output
+        ping_output=$(ping -c 5 -W 1 -M do -s "$payload" "$target_ip" 2>&1)
+        local loss="100"
+        local avg_ping="-"
+        local status
+
+        if echo "$ping_output" | grep -q "0% packet loss"; then
+            loss="0"
+            if echo "$ping_output" | grep -q "rtt"; then
+                avg_ping=$(echo "$ping_output" | grep "rtt" | awk -F'/' '{print $5}' | cut -d'.' -f1)
+                [ -z "$avg_ping" ] && avg_ping=$(echo "$ping_output" | grep "rtt" | sed -n 's/.*= \([0-9.]*\)\/[0-9.]*\/[0-9.]*\/[0-9.]* ms.*/\1/p' | cut -d'.' -f1)
+            fi
+            status="${GREEN}✓ PERFECT${NC}"
+
+            if [ "$mtu" -gt "${best_mtu:-0}" ]; then
+                best_mtu="$mtu"
+                best_loss="$loss"
+                best_ping="$avg_ping"
+            fi
+            
+        elif echo "$ping_output" | grep -q "[0-9]\+% packet loss"; then
+            loss=$(echo "$ping_output" | grep -o "[0-9]\+% packet loss" | grep -o "[0-9]\+")
+            if echo "$ping_output" | grep -q "rtt"; then
+                avg_ping=$(echo "$ping_output" | grep "rtt" | awk -F'/' '{print $5}' | cut -d'.' -f1)
+            fi
+            
+            if [ "$loss" -le 10 ]; then
+                status="${GREEN}✓ GOOD${NC}"
+                if [ -z "$best_mtu" ] || [ "$loss" -lt "$best_loss" ]; then
+                    best_mtu="$mtu"
+                    best_loss="$loss"
+                    best_ping="$avg_ping"
+                fi
+            elif [ "$loss" -le 30 ]; then
+                status="${YELLOW}⚠ FAIR${NC}"
+                if [ -z "$best_mtu" ] || [ "$loss" -lt "$best_loss" ]; then
+                    best_mtu="$mtu"
+                    best_loss="$loss"
+                    best_ping="$avg_ping"
+                fi
+            else
+                status="${RED}✗ POOR${NC}"
+            fi
+            
+        elif echo "$ping_output" | grep -q "packets transmitted" && echo "$ping_output" | grep -q "received"; then
+            local transmitted received
+            transmitted=$(echo "$ping_output" | grep -o "[0-9]\+ packets transmitted" | grep -o "[0-9]\+")
+            received=$(echo "$ping_output" | grep -o "[0-9]\+ packets received" | grep -o "[0-9]\+")
+            
+            if [ -n "$transmitted" ] && [ -n "$received" ] && [ "$transmitted" -gt 0 ] 2>/dev/null; then
+                loss=$(( (transmitted - received) * 100 / transmitted ))
+                
+                if echo "$ping_output" | grep -q "rtt"; then
+                    avg_ping=$(echo "$ping_output" | grep "rtt" | awk -F'/' '{print $5}' | cut -d'.' -f1)
+                fi
+                
+                if [ "$loss" -eq 0 ]; then
+                    status="${GREEN}✓ PERFECT${NC}"
+                    if [ "$mtu" -gt "${best_mtu:-0}" ]; then
+                        best_mtu="$mtu"
+                        best_loss="$loss"
+                        best_ping="$avg_ping"
+                    fi
+                elif [ "$loss" -le 10 ]; then
+                    status="${GREEN}✓ GOOD${NC}"
+                    if [ -z "$best_mtu" ] || [ "$loss" -lt "$best_loss" ]; then
+                        best_mtu="$mtu"
+                        best_loss="$loss"
+                        best_ping="$avg_ping"
+                    fi
+                elif [ "$loss" -le 30 ]; then
+                    status="${YELLOW}⚠ FAIR${NC}"
+                    if [ -z "$best_mtu" ] || [ "$loss" -lt "$best_loss" ]; then
+                        best_mtu="$mtu"
+                        best_loss="$loss"
+                        best_ping="$avg_ping"
+                    fi
+                else
+                    status="${RED}✗ POOR${NC}"
+                fi
+            else
+                status="${RED}✗ FAILED${NC}"
+            fi
+        else
+            status="${RED}✗ FAILED${NC}"
+        fi
+        
+        test_results+=("$mtu:$loss:$avg_ping")
+
+        printf "│ %-8s │ %-12s │ " "$mtu" "$payload"
+        printf "%-11s │ " "${loss}%"
+        printf "%-12s │ " "$avg_ping"
+        echo -e " $status      │"
+    done
+    
+    echo -e "${CYAN}└──────────┴──────────────┴─────────────┴──────────────┴─────────────────┘${NC}\n"
+
+    if [ -z "$best_mtu" ] || [ "$best_loss" -eq 100 ]; then
+        local min_loss=100
+        for result in "${test_results[@]}"; do
+            local mtu=$(echo "$result" | cut -d: -f1)
+            local loss=$(echo "$result" | cut -d: -f2)
+            if [[ "$loss" =~ ^[0-9]+$ ]] && [ "$loss" -lt "$min_loss" ]; then
+                min_loss="$loss"
+                best_mtu="$mtu"
+                best_loss="$loss"
+            fi
+        done
+    fi
+    
+    if [ "$silent_mode" = "normal" ]; then
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}Recommendations for $target_name${NC}"
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}\n"
+        
+        if [ -n "$best_mtu" ] && [ "$best_loss" -lt 100 ]; then
+            if [ "$best_loss" -eq 0 ]; then
+                echo -e " ${GREEN}✓ Best MTU: $best_mtu (0% loss, ${best_ping:-?}ms)${NC}"
+            else
+                echo -e " ${YELLOW}⚠ Best MTU: $best_mtu (${best_loss}% loss, ${best_ping:-?}ms)${NC}"
+            fi
+            
+            echo -e "\n${CYAN}Recommended MTU settings:${NC}"
+            local recommended=""
+            
+            if [ "$best_mtu" -ge 1428 ]; then
+                echo -e " • ${GREEN}Recommended: 1350${NC} (best balance)"
+                recommended="1350"
+            elif [ "$best_mtu" -ge 1378 ]; then
+                echo -e " • ${GREEN}Recommended: 1350${NC} (stable)"
+                recommended="1350"
+            elif [ "$best_mtu" -ge 1308 ]; then
+                echo -e " • ${GREEN}Recommended: 1300${NC} (very stable)"
+                recommended="1300"
+            elif [ "$best_mtu" -ge 1228 ]; then
+                echo -e " • ${GREEN}Recommended: 1280${NC} (ultra stable)"
+                recommended="1280"
+            else
+                echo -e " • ${GREEN}Recommended: 1200${NC} (maximum compatibility)"
+                recommended="1200"
+            fi
+            
+            echo ""
+            read -p "Apply recommended MTU ($recommended) to this server's client config? (y/N): " apply_mtu
+            
+            if [[ "$apply_mtu" =~ ^[Yy]$ ]]; then
+                local target_config=""
+                while IFS= read -r -d '' file; do
+                    if grep -q "$target_ip" "$file" 2>/dev/null; then
+                        target_config="$file"
+                        break
+                    fi
+                done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+                
+                if [ -n "$target_config" ]; then
+                    local backup_file="${target_config}.backup-$(date +%Y%m%d-%H%M%S)"
+                    cp "$target_config" "$backup_file"
+                    print_info "Backup created: $(basename "$backup_file")"
+
+                    if grep -q "mtu:" "$target_config"; then
+                        sed -i "s/mtu:.*/mtu: $recommended/" "$target_config"
+                    else
+                        if grep -q "kcp:" "$target_config"; then
+                            sed -i "/kcp:/a\    mtu: $recommended" "$target_config"
+                        else
+                            sed -i "/transport:/a \  kcp:\n    mtu: $recommended" "$target_config"
+                        fi
+                    fi
+                    print_success "MTU set to $recommended in $(basename "$target_config")"
+
+                    local config_name=$(basename "$target_config" .yaml)
+                    local service_name="paqet-${config_name}.service"
+                    
+                    if systemctl list-unit-files 2>/dev/null | grep -q "$service_name"; then
+                        echo ""
+                        read -p "Restart this service now? (y/N): " restart_svc
+                        if [[ "$restart_svc" =~ ^[Yy]$ ]]; then
+                            systemctl restart "$service_name"
+                            if systemctl is-active --quiet "$service_name"; then
+                                print_success "Service restarted successfully"
+                            else
+                                print_error "Service failed to restart"
+                            fi
+                        fi
+                    fi
+                else
+                    print_warning "Could not find config file for this server"
+                fi
+            fi
+        else
+            echo -e " ${RED}✗ No successful MTU test${NC}"
+            echo -e " • The target server may be unreachable or blocking ICMP"
+            echo -e " • Recommended MTU: 1200 (safe default)"
+        fi
+    fi
+    
+    if [ "$silent_mode" = "silent" ]; then
+        local summary="SUMMARY: $target_name → Best MTU: ${best_mtu:-None} (${best_loss:-100}% loss)"
+        echo "$summary"
+        echo "BEST_MTU:${best_mtu:-1200}"
+    fi
+}
+
+# Helper function to restart all services
+restart_all_services() {
+    local services=("$@")
+    echo -e "\n${YELLOW}Restarting all Paqet services...${NC}"
+    
+    local success_count=0
+    local fail_count=0
+    
+    for svc in "${services[@]}"; do
+        local service_name="${svc%.service}"
+        local display_name="${service_name#paqet-}"
+        
+        echo -n " Restarting $display_name... "
+        
+        if systemctl restart "$svc" >/dev/null 2>&1; then
+            sleep 1
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                echo -e "${GREEN}✅ SUCCESS${NC}"
+                ((success_count++))
+            else
+                echo -e "${RED}❌ FAILED (not running)${NC}"
+                ((fail_count++))
+            fi
+        else
+            echo -e "${RED}❌ FAILED${NC}"
+            ((fail_count++))
+        fi
+    done
+    
+    echo -e "\n${CYAN}Results:${NC}"
+    echo -e " ${GREEN}✅ Success:${NC} $success_count service(s)"
+    echo -e " ${RED}❌ Failed:${NC} $fail_count service(s)"
+}
+
+# Helper function for live logs
+live_log_all_services() {
+    local services=("$@")
+    echo -e "\n${YELLOW}Live Log Monitoring - All Paqet Tunnels${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    echo -e "${CYAN}Showing logs from all paqet services (Ctrl+C to exit)${NC}\n"
+    sleep 2
+    
+    local journal_args=""
+    for svc in "${services[@]}"; do
+        journal_args="$journal_args -u $svc"
+    done
+    
+    journalctl $journal_args -f --output=short-iso
+    echo -e "\n${YELLOW}Returned from log monitoring${NC}"
+    pause
+}
+
+# Helper function to delete all tunnels
+delete_all_tunnels() {
+    local services=("$@")
+    echo -e "\n${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                          WARNING!                            ║${NC}"
+    echo -e "${RED}║    This will delete ALL Paqet tunnels and configurations!    ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    
+    echo -e "${YELLOW}Services to be deleted:${NC}"
+    for svc in "${services[@]}"; do
+        local service_name="${svc%.service}"
+        local display_name="${service_name#paqet-}"
+        echo -e " - ${CYAN}$display_name${NC}"
+    done
+    
+    echo ""
+    read -p "Are you ABSOLUTELY SURE? (type 'yes' to confirm): " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo -e "${YELLOW}Operation cancelled.${NC}"
+        pause
+        return
+    fi
+    
+    echo ""
+    print_step "Stopping and removing all services..."
+    
+    local deleted_count=0
+    
+    for svc in "${services[@]}"; do
+        local service_name="${svc%.service}"
+        local display_name="${service_name#paqet-}"
+        local config_file="$CONFIG_DIR/$display_name.yaml"
+        
+        echo -n " Removing $display_name... "
+        
+        remove_cronjob "$service_name" >/dev/null 2>&1 || true
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+        
+        if [ -f "$SERVICE_DIR/$svc" ]; then
+            rm -f "$SERVICE_DIR/$svc" >/dev/null 2>&1 || true
+        fi
+        
+        if [ -f "$config_file" ]; then
+            rm -f "$config_file" >/dev/null 2>&1 || true
+        fi
+        
+        echo -e "${GREEN}✅ Removed${NC}"
+        ((deleted_count++))
+    done
+    
+    systemctl daemon-reload >/dev/null 2>&1
+    
+    echo -e "\n${CYAN}Results:${NC}"
+    echo -e " ${GREEN}✅ Deleted:${NC} $deleted_count service(s)"
+    print_success "All tunnels deleted successfully!"
+    pause
+}
+
+# ================================================
+# NAT PORT FORWARDING FUNCTIONS
+# ================================================
+
+ensure_ip_forwarding() {
+    local current=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [ "$current" != "1" ]; then
+        print_step "Enabling IP forwarding..."
+        echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/30-ip_forward.conf
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+        sysctl --system > /dev/null 2>&1
+        print_success "IP forwarding enabled"
+    fi
+}
+
+add_nat_forward_multi_port() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Multi-Port NAT Forward${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${CYAN}Forward specific ports (TCP+UDP) to a destination server${NC}"
+    echo ""
+    
+    local dest_ip
+    while true; do
+        echo -e "${YELLOW}Enter destination server IP (e.g. 1.2.3.4). Press Enter to cancel:${NC}"
+        read -p "> " dest_ip
+        [ -z "$dest_ip" ] && { print_info "Cancelled."; pause; return 0; }
+        if validate_ip "$dest_ip"; then
+            break
+        fi
+        print_error "Invalid IP address format. Try again or press Enter to cancel."
+    done
+    
+    local ports
+    while true; do
+        echo -e "${YELLOW}Enter ports to forward (comma-separated, e.g. 443,8443,2053):${NC}"
+        read -p "> " ports
+        [ -z "$ports" ] && { print_error "Ports required"; continue; }
+        ports=$(echo "$ports" | tr -d ' ')
+        if [[ "$ports" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            break
+        fi
+        print_error "Invalid port format. Use comma-separated numbers (e.g. 443,8443)."
+    done
+    
+    ensure_ip_forwarding
+    
+    print_step "Adding NAT forwarding rules: ports $ports -> $dest_ip ..."
+    
+    # TCP
+    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $ports -j DNAT --to-destination $dest_ip
+    iptables -t nat -A POSTROUTING -p tcp --match multiport --dports $ports -j MASQUERADE
+    # UDP
+    iptables -t nat -A PREROUTING -p udp --match multiport --dports $ports -j DNAT --to-destination $dest_ip
+    iptables -t nat -A POSTROUTING -p udp --match multiport --dports $ports -j MASQUERADE
+    
+    save_iptables
+    print_success "NAT forwarding added: ports $ports -> $dest_ip (TCP+UDP)"
+    pause
+}
+
+add_nat_forward_all_ports() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}All-Ports NAT Forward${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    echo -e "${CYAN}Forward ALL ports to a destination, except specified exclusions${NC}"
+    echo ""
+    
+    local relay_ip
+    while true; do
+        echo -e "${YELLOW}Enter THIS server's IP (relay IP). Press Enter to cancel:${NC}"
+        read -p "> " relay_ip
+        [ -z "$relay_ip" ] && { print_info "Cancelled."; pause; return 0; }
+        if validate_ip "$relay_ip"; then
+            break
+        fi
+        print_error "Invalid IP address format. Try again or press Enter to cancel."
+    done
+    
+    local dest_ip
+    while true; do
+        echo -e "${YELLOW}Enter destination server IP. Press Enter to cancel:${NC}"
+        read -p "> " dest_ip
+        [ -z "$dest_ip" ] && { print_info "Cancelled."; pause; return 0; }
+        if validate_ip "$dest_ip"; then
+            break
+        fi
+        print_error "Invalid IP address format. Try again or press Enter to cancel."
+    done
+    
+    local exclude_ports
+    while true; do
+        echo -e "${YELLOW}Enter ports to EXCLUDE (comma-separated, e.g. 22,80). Press Enter to cancel:${NC}"
+        read -p "> " exclude_ports
+        [ -z "$exclude_ports" ] && { print_info "Cancelled."; pause; return 0; }
+        exclude_ports=$(echo "$exclude_ports" | tr -d ' ')
+        if [[ "$exclude_ports" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            break
+        fi
+        print_error "Invalid port format. Use comma-separated numbers (e.g. 22,80)."
+    done
+    
+    # Warn about SSH
+    if ! echo ",$exclude_ports," | grep -q ",22,"; then
+        print_warning "⚠️  Port 22 (SSH) is NOT in your exclusion list!"
+        echo -e "${RED}You may lose SSH access if port 22 is forwarded.${NC}"
+        read -p "Continue without excluding port 22? (y/N): " skip_ssh_warn
+        if [[ ! "$skip_ssh_warn" =~ ^[Yy]$ ]]; then
+            print_info "Cancelled. Add port 22 to your exclusion list."
+            pause
+            return 1
+        fi
+    fi
+    
+    ensure_ip_forwarding
+    
+    print_step "Adding all-ports NAT forwarding to $dest_ip (excluding $exclude_ports)..."
+    
+    # First: redirect excluded ports back to this server (keeps them local)
+    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $exclude_ports -j DNAT --to-destination $relay_ip
+    iptables -t nat -A PREROUTING -p udp --match multiport --dports $exclude_ports -j DNAT --to-destination $relay_ip
+    # Then: catch-all forward everything else to destination
+    iptables -t nat -A PREROUTING -p tcp -j DNAT --to-destination $dest_ip
+    iptables -t nat -A PREROUTING -p udp -j DNAT --to-destination $dest_ip
+    iptables -t nat -A POSTROUTING -j MASQUERADE
+    
+    save_iptables
+    print_success "All-ports NAT forwarding added to $dest_ip (excluding $exclude_ports)"
+    pause
+}
+
+view_nat_rules() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Current NAT Table Rules${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    if iptables -t nat -L -v --line-numbers 2>/dev/null | grep -q "Chain"; then
+        iptables -t nat -L -v --line-numbers 2>/dev/null || print_error "Failed to read NAT rules"
+    else
+        print_info "No NAT rules found"
+    fi
+    
+    echo ""
+    pause
+}
+
+remove_nat_forward_by_dest() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Remove NAT Forwarding Rules by Destination${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+    
+    view_nat_rules
+    echo ""
+    
+    echo -e "${YELLOW}Enter destination IP to remove rules for. Press Enter to cancel:${NC}"
+    read -p "> " dest_ip
+    if [ -z "$dest_ip" ]; then
+        print_info "Cancelled."
+        pause
+        return 0
+    fi
+    
+    if ! validate_ip "$dest_ip"; then
+        print_error "Invalid IP address"
+        pause
+        return 1
+    fi
+    
+    print_step "Removing NAT rules targeting $dest_ip..."
+    
+    local removed=0
+    
+    # Remove PREROUTING rules targeting this IP (reverse order to preserve line numbers)
+    local pre_rules
+    pre_rules=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "to:${dest_ip}" | awk '{print $1}' | sort -rn)
+    for num in $pre_rules; do
+        iptables -t nat -D PREROUTING $num 2>/dev/null && ((removed++))
+    done
+    
+    # Remove POSTROUTING rules that reference this IP (if any)
+    local post_rules
+    post_rules=$(iptables -t nat -L POSTROUTING --line-numbers -n 2>/dev/null | grep "to:${dest_ip}" | awk '{print $1}' | sort -rn)
+    for num in $post_rules; do
+        iptables -t nat -D POSTROUTING $num 2>/dev/null && ((removed++))
+    done
+    
+    if [ $removed -gt 0 ]; then
+        save_iptables
+        print_success "Removed $removed NAT rule(s) targeting $dest_ip"
+    else
+        print_warning "No NAT rules found targeting $dest_ip"
+    fi
+    
+    pause
+}
+
+flush_nat_rules() {
+    clear
+    echo -e "\n${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                     WARNING!                                  ║${NC}"
+    echo -e "${RED}║         This will flush ALL iptables NAT rules!               ║${NC}"
+    echo -e "${RED}║   Connection protection rules (raw/mangle) will NOT be affected${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    
+    read -p "Are you sure? (type 'yes' to confirm): " confirm
+    if [ "$confirm" != "yes" ]; then
+        print_info "Flush cancelled"
+        pause
+        return
+    fi
+    
+    print_step "Flushing NAT table..."
+    iptables -t nat -F
+    iptables -t nat -X 2>/dev/null || true
+    
+    save_iptables
+    print_success "All NAT rules flushed"
+    
+    echo ""
+    read -p "Also disable IP forwarding? (y/N): " disable_fwd
+    if [[ "$disable_fwd" =~ ^[Yy]$ ]]; then
+        echo "net.ipv4.ip_forward=0" > /etc/sysctl.d/30-ip_forward.conf
+        sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1
+        sysctl --system > /dev/null 2>&1
+        print_success "IP forwarding disabled"
+    fi
+    
+    pause
+}
+
+save_iptables() {
+    if ! command -v iptables-save >/dev/null 2>&1; then
+        print_warning "iptables-save not found - rules will NOT persist after reboot!"
+        return 1
+    fi
+
+    mkdir -p /etc/iptables 2>/dev/null
+
+    if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+        chmod 600 /etc/iptables/rules.v4 2>/dev/null
+        print_success "iptables rules saved to /etc/iptables/rules.v4"
+    else
+        print_error "Failed to save iptables rules!"
+        return 1
+    fi
+
+    # Try distribution-specific persistence tools
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 && \
+            print_info "Rules also saved via netfilter-persistent"
+    elif command -v service >/dev/null 2>&1 && systemctl is-active iptables >/dev/null 2>&1; then
+        service iptables save >/dev/null 2>&1 && \
+            print_info "Rules saved via iptables service"
+    fi
+
+    return 0
 }
 
 # ================================================
@@ -3374,7 +4750,898 @@ uninstall_paqet() {
     pause
     return
 }
+# ================================================
+# TELEGRAM BOT CONFIGURATION
+# ================================================
 
+readonly BOT_CONFIG_DIR="/etc/telegram-paqet-bot"
+readonly BOT_CONFIG_FILE="$BOT_CONFIG_DIR/config.conf"
+readonly BOT_LOG_FILE="/var/log/telegram-paqet-bot.log"
+readonly BOT_SERVICE="telegram-paqet-bot"
+readonly BOT_SCRIPT="/usr/local/bin/telegram-paqet-bot"
+
+# ================================================
+# BOT CORE FUNCTIONS
+# ================================================
+
+# Read yes/no confirmation
+read_confirm() {
+    local prompt="$1"
+    local varname="$2"
+    local default="$3"
+    local value=""
+    
+    while true; do
+        if [ "$default" = "y" ]; then
+            echo -e "${YELLOW}${prompt} (Y/n):${NC}"
+        elif [ "$default" = "n" ]; then
+            echo -e "${YELLOW}${prompt} (y/N):${NC}"
+        else
+            echo -e "${YELLOW}${prompt} (y/n):${NC}"
+        fi
+        read -p "> " value < /dev/tty
+        
+        if [ -z "$value" ] && [ -n "$default" ]; then
+            value="$default"
+        fi
+        
+        case "$value" in
+            [Yy]|[Yy][Ee][Ss]) eval "$varname=true"; return 0 ;;
+            [Nn]|[Nn][Oo]) eval "$varname=false"; return 0 ;;
+            *) print_error "Please enter 'y' for yes or 'n' for no."; echo "" ;;
+        esac
+    done
+}
+
+# Initialize bot configuration
+init_bot_config() {
+    mkdir -p "$BOT_CONFIG_DIR"
+    if [ ! -f "$BOT_CONFIG_FILE" ]; then
+        cat > "$BOT_CONFIG_FILE" << EOF
+# Paqet Telegram Bot Configuration
+# Last updated: $(date)
+BOT_TOKEN=""
+CHAT_ID=""
+ENABLE_BOT="false"
+ENABLE_BOOT_REPORT="true"
+ENABLE_SERVICE_WATCH="true"
+WATCH_INTERVAL="60"
+SOCKS5_PROXY=""
+USE_SOCKS5="false"
+EOF
+        chmod 600 "$BOT_CONFIG_FILE"
+        print_success "Bot configuration created at $BOT_CONFIG_FILE"
+    fi
+}
+
+# Load bot configuration
+load_bot_config() {
+    if [ -f "$BOT_CONFIG_FILE" ]; then
+        source "$BOT_CONFIG_FILE"
+    else
+        BOT_TOKEN=""
+        CHAT_ID=""
+        ENABLE_BOT="false"
+        ENABLE_BOOT_REPORT="true"
+        ENABLE_SERVICE_WATCH="true"
+        WATCH_INTERVAL="60"
+        SOCKS5_PROXY=""
+        USE_SOCKS5="false"
+    fi
+}
+
+# Save bot configuration
+save_bot_config() {
+    cat > "$BOT_CONFIG_FILE" << EOF
+# Paqet Telegram Bot Configuration
+# Last updated: $(date)
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+ENABLE_BOT="$ENABLE_BOT"
+ENABLE_BOOT_REPORT="$ENABLE_BOOT_REPORT"
+ENABLE_SERVICE_WATCH="$ENABLE_SERVICE_WATCH"
+WATCH_INTERVAL="$WATCH_INTERVAL"
+SOCKS5_PROXY="$SOCKS5_PROXY"
+USE_SOCKS5="$USE_SOCKS5"
+EOF
+    chmod 600 "$BOT_CONFIG_FILE"
+    print_success "Bot configuration saved"
+}
+
+# ================================================
+# Detect SOCKS5 proxy from client configs
+# ================================================
+detect_socks5_proxy() {
+    local socks5_found=""
+    local socks5_port=""
+    echo "Checking Paqet client configs for SOCKS5 proxy..." >> "$BOT_LOG_FILE"
+    
+    # Find all client configs
+    while IFS= read -r -d '' file; do
+        if grep -q "role:.*client" "$file" 2>/dev/null; then
+            local config_name=$(basename "$file" .yaml)
+            echo "Checking client: $config_name" >> "$BOT_LOG_FILE"
+            
+            # Look for socks5 section
+            if grep -q "socks5:" "$file"; then
+                # Extract port from socks5 listen address
+                socks5_port=$(grep -A2 "socks5:" "$file" | grep "listen:" | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+                
+                if [ -n "$socks5_port" ]; then
+                    socks5_found="127.0.0.1:$socks5_port"
+                    echo "Found SOCKS5 proxy in $config_name on port $socks5_port" >> "$BOT_LOG_FILE"
+                    break
+                fi
+            fi
+        fi
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    echo "$socks5_found"
+}
+
+# ================================================
+# Add SOCKS5 to first client if not exists
+# ================================================
+add_socks5_to_client() {
+    local first_client=""
+    local client_file=""
+    local result=""
+    
+    # Find first client config
+    while IFS= read -r -d '' file; do
+        if grep -q "role:.*client" "$file" 2>/dev/null; then
+            first_client=$(basename "$file" .yaml)
+            client_file="$file"
+            break
+        fi
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    
+    if [ -n "$client_file" ]; then
+        echo "Adding SOCKS5 proxy to client: $first_client" >> "$BOT_LOG_FILE"
+        
+        # Check if socks5 section already exists
+        if grep -q "socks5:" "$client_file"; then
+            echo "SOCKS5 already exists in this config" >> "$BOT_LOG_FILE"
+            # Extract existing port
+            local existing_port=$(grep -A2 "socks5:" "$client_file" | grep "listen:" | grep -oE ':[0-9]+' | tr -d ':' | head -1)
+            result="127.0.0.1:$existing_port"
+        else
+            # Add socks5 section before network or at the end
+            if grep -q "network:" "$client_file"; then
+                # Insert before network section
+                sed -i '/network:/i\
+socks5:\
+  - listen: "127.0.0.1:1080"\
+' "$client_file"
+            else
+                # Add at the end
+                echo "" >> "$client_file"
+                echo "socks5:" >> "$client_file"
+                echo "  - listen: \"127.0.0.1:1080\"" >> "$client_file"
+            fi
+            echo "SOCKS5 proxy added to $first_client on port 1080" >> "$BOT_LOG_FILE"
+            
+            # Restart the client service
+            systemctl restart "paqet-$first_client" 2>/dev/null
+            echo "Service paqet-$first_client restarted" >> "$BOT_LOG_FILE"
+            
+            result="127.0.0.1:1080"
+        fi
+    fi
+    echo "$result"
+}
+
+# Send Telegram message with multiple fallbacks
+send_telegram_message() {
+    local message="$1"
+    local parse_mode="${2:-HTML}"
+    
+    if [ "$ENABLE_BOT" != "true" ] || [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+        return 1
+    fi
+
+    message=$(echo -e "$message" | sed 's/"/\\"/g')
+    
+    local success=1
+    local response
+    
+    # ============================================
+    # METHOD 1: Through detected SOCKS5 proxy
+    # ============================================
+    if [ "$USE_SOCKS5" = "true" ] && [ -n "$SOCKS5_PROXY" ]; then
+        response=$(curl -s --max-time 8 --socks5-hostname "$SOCKS5_PROXY" \
+            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            success=0
+            echo "[$(date)] Message sent via SOCKS5 proxy" >> "$BOT_LOG_FILE"
+        fi
+    fi
+    
+    # ============================================
+    # METHOD 2: Through behzad.workers.dev (Proxy)
+    # ============================================
+    if [ $success -ne 0 ]; then
+        response=$(curl -s --max-time 8 \
+            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            success=0
+            echo "[$(date)] Message sent via behzad.workers.dev" >> "$BOT_LOG_FILE"
+        fi
+    fi
+    
+    # ============================================
+    # METHOD 3: Direct connection (No proxy)
+    # ============================================
+    if [ $success -ne 0 ]; then
+        response=$(curl -s --max-time 5 \
+            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            success=0
+            echo "[$(date)] Message sent directly" >> "$BOT_LOG_FILE"
+        fi
+    fi
+    
+    # ============================================
+    # METHOD 4: Through workers.dev with URL-encoded (Last resort)
+    # ============================================
+    if [ $success -ne 0 ]; then
+        response=$(curl -s --max-time 8 \
+            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT_ID" \
+            --data-urlencode "text=$message" \
+            --data-urlencode "parse_mode=$parse_mode" 2>&1)
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            success=0
+            echo "[$(date)] Message sent via workers.dev (URL-encoded)" >> "$BOT_LOG_FILE"
+        fi
+    fi
+    
+    if [ $success -eq 0 ]; then
+        return 0
+    else
+        echo "[$(date)] Failed to send message. Last response: $response" >> "$BOT_LOG_FILE"
+        return 1
+    fi
+}
+
+# Debug function
+print_debug() {
+    if [ "$BOT_DEBUG" = "true" ]; then
+        echo "[DEBUG] $1" >> "$BOT_LOG_FILE"
+    fi
+}
+
+# Create bot main script
+create_bot_script() {
+    cat > "$BOT_SCRIPT" << 'EOF'
+#!/bin/bash
+
+# Paqet Telegram Bot - Monitor Service
+# Auto-generated by Paqet Manager
+
+BOT_CONFIG="/etc/telegram-paqet-bot/config.conf"
+LOG_FILE="/var/log/telegram-paqet-bot.log"
+LAST_STATE_FILE="/etc/telegram-paqet-bot/last_state"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+load_config() {
+    if [ -f "$BOT_CONFIG" ]; then
+        source "$BOT_CONFIG"
+    else
+        log "ERROR: Config file not found"
+        exit 1
+    fi
+}
+
+send_alert() {
+    local message="$1"
+    if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ "$ENABLE_BOT" = "true" ]; then
+        message=$(echo -e "$message" | sed 's/"/\\"/g')
+        
+        local success=1
+        local response
+        
+        # METHOD 1: Through SOCKS5 proxy (if configured)
+        if [ "$USE_SOCKS5" = "true" ] && [ -n "$SOCKS5_PROXY" ]; then
+            response=$(curl -s --max-time 8 --socks5-hostname "$SOCKS5_PROXY" \
+                -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
+            
+            if echo "$response" | grep -q '"ok":true'; then
+                success=0
+                log "Alert sent via SOCKS5 proxy"
+            fi
+        fi
+        
+        # METHOD 2: Through behzad.workers.dev (JSON)
+        if [ $success -ne 0 ]; then
+            response=$(curl -s --max-time 8 \
+                -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
+            
+            if echo "$response" | grep -q '"ok":true'; then
+                success=0
+                log "Alert sent via behzad.workers.dev (JSON)"
+            fi
+        fi
+        
+        # METHOD 3: Direct connection
+        if [ $success -ne 0 ]; then
+            response=$(curl -s --max-time 5 \
+                -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
+            
+            if echo "$response" | grep -q '"ok":true'; then
+                success=0
+                log "Alert sent directly"
+            fi
+        fi
+        
+        # METHOD 4: Through workers.dev with URL-encoded
+        if [ $success -ne 0 ]; then
+            response=$(curl -s --max-time 8 \
+                -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+                --data-urlencode "chat_id=$CHAT_ID" \
+                --data-urlencode "text=$message" \
+                --data-urlencode "parse_mode=HTML" 2>&1)
+            
+            if echo "$response" | grep -q '"ok":true'; then
+                success=0
+                log "Alert sent via workers.dev (URL-encoded)"
+            fi
+        fi
+        
+        if [ $success -eq 0 ]; then
+            log "Alert delivered successfully"
+        else
+            log "Failed to send alert after all methods. Last response: $response"
+        fi
+    fi
+}
+
+check_services() {
+    local changes=""
+    local current_state=""
+    
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        local status=$(systemctl is-active "$svc" 2>/dev/null)
+        local service_name="${svc%.service}"
+        local config_name="${service_name#paqet-}"
+        
+        current_state="$current_state${svc}:${status}\n"
+        
+        local last_status=$(grep "^${svc}:" "$LAST_STATE_FILE" 2>/dev/null | cut -d: -f2)
+        if [ "$last_status" != "$status" ]; then
+            local emoji=""
+            case "$status" in
+                active) emoji="✅" ;;
+                failed) emoji="❌" ;;
+                inactive) emoji="💤" ;;
+                *) emoji="❓" ;;
+            esac
+            
+            local message="$emoji <b>Service $config_name</b>\n"
+            message+="Status: $status\n"
+            message+="Time: $(date '+%Y-%m-%d %H:%M:%S')"
+            
+            changes="$changes$message\n\n"
+        fi
+    done < <(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep "paqet-" | awk '{print $1}' || true)
+    
+    echo -e "$current_state" > "$LAST_STATE_FILE"
+    
+    if [ -n "$changes" ]; then
+        send_alert "🔔 <b>Paqet Service Status Changes</b>\n\n$changes"
+    fi
+}
+
+send_boot_report() {
+    local report="🚀 <b>Server Boot Report - $(hostname)</b>\n\n"
+    report+="⏰ <b>Time:</b> $(date '+%Y-%m-%d %H:%M:%S')\n\n"
+    
+    report+="🔧 <b>Paqet Services:</b>\n"
+    local services=()
+    while IFS= read -r svc; do
+        services+=("$svc")
+    done < <(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep "paqet-" | awk '{print $1}' || true)
+    
+    if [ ${#services[@]} -gt 0 ]; then
+        for svc in "${services[@]}"; do
+            local status=$(systemctl is-active "$svc" 2>/dev/null)
+            local emoji=""
+            case "$status" in
+                active) emoji="✅" ;;
+                failed) emoji="❌" ;;
+                inactive) emoji="💤" ;;
+                *) emoji="❓" ;;
+            esac
+            report+="  $emoji $svc: $status\n"
+        done
+    else
+        report+="  No Paqet services found\n"
+    fi
+    
+    # Add SOCKS5 status if configured
+    if [ -n "$SOCKS5_PROXY" ]; then
+        report+="\n🔄 <b>Proxy Status:</b>\n"
+        report+="  SOCKS5: $SOCKS5_PROXY (enabled)\n"
+    fi
+    
+    send_alert "$report"
+}
+
+main() {
+    load_config
+    touch "$LAST_STATE_FILE"
+    
+    if [ "$ENABLE_BOT" = "true" ] && [ "$ENABLE_BOOT_REPORT" = "true" ]; then
+        send_boot_report
+    fi
+    
+    log "Bot started with interval: ${WATCH_INTERVAL}s"
+    
+    while true; do
+        if [ "$ENABLE_BOT" = "true" ] && [ "$ENABLE_SERVICE_WATCH" = "true" ]; then
+            check_services
+        fi
+        sleep "${WATCH_INTERVAL:-60}"
+    done
+}
+
+main
+EOF
+    chmod +x "$BOT_SCRIPT"
+    touch "$BOT_CONFIG_DIR/last_state"
+    chmod 666 "$BOT_CONFIG_DIR/last_state"
+    print_success "Bot script created at $BOT_SCRIPT"
+}
+
+# Create bot service file
+create_bot_service() {
+    cat > "/etc/systemd/system/$BOT_SERVICE.service" << EOF
+[Unit]
+Description=Paqet Telegram Bot Monitor
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=$BOT_SCRIPT
+Restart=always
+RestartSec=10
+User=root
+Group=root
+Environment="BOT_CONFIG=$BOT_CONFIG_FILE"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    print_success "Bot service created"
+}
+
+# Remove bot completely
+remove_bot() {
+    clear
+    echo -e "\n${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║              Uninstall Telegram Bot                           ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    
+    print_warning "This will completely remove the Telegram bot and all its files."
+    echo -e "${GREEN}Note: This only removes the Telegram bot files.${NC}"
+    echo -e "${GREEN}Your Paqet tunnels and services will NOT be affected.${NC}"
+    echo ""
+    read_confirm "Are you ABSOLUTELY SURE?" confirm_remove "n"
+    
+    if [ "$confirm_remove" != "true" ]; then
+        print_info "Removal cancelled"
+        pause
+        return
+    fi
+    
+    print_step "Stopping bot service..."
+    systemctl stop $BOT_SERVICE 2>/dev/null
+    systemctl disable $BOT_SERVICE 2>/dev/null
+    
+    print_step "Removing service file..."
+    rm -f "/etc/systemd/system/$BOT_SERVICE.service"
+    systemctl daemon-reload
+    
+    print_step "Removing bot script..."
+    rm -f "$BOT_SCRIPT"
+    
+    print_step "Removing configuration and logs..."
+    read_confirm "Remove all configuration files and logs?" remove_configs "n"
+    
+    if [ "$remove_configs" = "true" ]; then
+        rm -rf "$BOT_CONFIG_DIR"
+        rm -f "$BOT_LOG_FILE"
+        print_success "All bot files removed"
+    else
+        print_info "Configuration preserved at $BOT_CONFIG_DIR"
+        print_info "Logs preserved at $BOT_LOG_FILE"
+    fi
+    
+    print_success "✅ Bot uninstalled successfully"
+    pause
+}
+
+# ================================================
+# BOT SETUP WIZARD
+# ================================================
+setup_bot_wizard() {
+    clear
+    show_banner
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║              🤖 Telegram Bot Setup Wizard                    ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    
+    print_step "This wizard will configure and start the Telegram bot in one go"
+    echo ""
+    
+    # 1. Get Bot Token
+    print_input "Step 1: Enter your Bot Token"
+    echo -e "${CYAN}How to get:${NC}"
+    echo "  1. Open Telegram and search for @BotFather"
+    echo "  2. Send /newbot and follow instructions"
+    echo "  3. Copy the token (looks like: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz)"
+    echo ""
+    
+    local token=""
+    while [ -z "$token" ]; do
+        read -p "Bot Token > " token
+        token=$(echo "$token" | tr -d '[:space:]')
+        if [ -z "$token" ]; then
+            print_error "Token cannot be empty"
+        fi
+    done
+    BOT_TOKEN="$token"
+    print_success "Bot token saved"
+    echo ""
+    
+    # 2. Get Chat ID
+    print_input "Step 2: Enter your Telegram Chat ID"
+    echo -e "${CYAN}How to get:${NC}"
+    echo "  1. Open Telegram and search for @userinfobot"
+    echo "  2. Send /start"
+    echo "  3. Your ID will be shown (usually a number)"
+    echo ""
+    
+    local chat_id=""
+    while [ -z "$chat_id" ]; do
+        read -p "Chat ID > " chat_id
+        chat_id=$(echo "$chat_id" | tr -d '[:space:]')
+        if [ -z "$chat_id" ]; then
+            print_error "Chat ID cannot be empty"
+        fi
+    done
+    CHAT_ID="$chat_id"
+    print_success "Chat ID saved"
+    echo ""
+    
+    # 3. Detect or configure SOCKS5 proxy
+    print_input "Step 3: Configuring SOCKS5 proxy for Telegram"
+    echo -e "${CYAN}Checking existing client configs for SOCKS5...${NC}"
+    
+    # Try to detect existing SOCKS5
+    local detected_proxy=$(detect_socks5_proxy)
+    
+    if [ -n "$detected_proxy" ]; then
+        SOCKS5_PROXY="$detected_proxy"
+        print_success "Found existing SOCKS5 proxy: $SOCKS5_PROXY"
+        USE_SOCKS5="true"
+    else
+        print_warning "No SOCKS5 proxy found in client configs"
+        read_confirm "Add SOCKS5 proxy to first client? (recommended)" add_socks5 "y"
+        
+        if [ "$add_socks5" = "true" ]; then
+            local added_proxy=$(add_socks5_to_client)
+            if [ -n "$added_proxy" ]; then
+                SOCKS5_PROXY="$added_proxy"
+                print_success "SOCKS5 proxy added: $SOCKS5_PROXY"
+                USE_SOCKS5="true"
+            else
+                print_error "Failed to add SOCKS5 proxy"
+                USE_SOCKS5="false"
+                SOCKS5_PROXY=""
+            fi
+        else
+            print_info "Continuing without SOCKS5 proxy"
+            USE_SOCKS5="false"
+            SOCKS5_PROXY=""
+        fi
+    fi
+    echo ""
+    
+    # 4. Ask for notification preferences
+    print_input "Step 4: Configure notification settings"
+    read_confirm "Enable boot reports? (recommended)" ENABLE_BOOT_REPORT "y"
+    read_confirm "Enable service status monitoring?" ENABLE_SERVICE_WATCH "y"
+    echo ""
+    
+    # 5. Ask for watch interval
+    print_input "Step 5: Set check interval"
+    echo -e "${CYAN}How often should the bot check for changes? (30-3600 seconds)${NC}"
+    read -p "Interval [60]: " interval
+    interval="${interval:-60}"
+    if [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 30 ] && [ "$interval" -le 3600 ]; then
+        WATCH_INTERVAL="$interval"
+    else
+        print_warning "Invalid interval, using default: 60 seconds"
+        WATCH_INTERVAL="60"
+    fi
+    echo ""
+    
+    # 6. Enable bot and save
+    ENABLE_BOT="true"
+    save_bot_config
+    
+    # 7. Create bot files
+    print_step "Creating bot files..."
+    create_bot_script
+    create_bot_service
+    
+    # 8. Start bot service
+    print_step "Starting bot service..."
+    systemctl enable $BOT_SERVICE >/dev/null 2>&1
+    systemctl start $BOT_SERVICE
+    sleep 2
+    
+    # 9. Check status and send test message
+    if systemctl is-active --quiet $BOT_SERVICE; then
+        print_success "✅ Bot service started successfully!"
+        
+        print_step "Sending test message..."
+        local test_message="✅ <b>Paqet Bot Successfully Installed!</b>\n\n"
+        test_message="${test_message}Bot is now active and monitoring your server.\n"
+        test_message="${test_message}📋 You will receive:\n"
+        test_message="${test_message}• Boot reports when server restarts\n"
+        test_message="${test_message}• Service status changes\n"
+        test_message="${test_message}• Packet loss alerts\n\n"
+        test_message="${test_message}⚙️ Settings:\n"
+        test_message="${test_message}• Watch interval: ${WATCH_INTERVAL}s\n"
+        test_message="${test_message}• Boot reports: ${ENABLE_BOOT_REPORT}\n"
+        test_message="${test_message}• Service watch: ${ENABLE_SERVICE_WATCH}\n"
+        
+        if [ -n "$SOCKS5_PROXY" ]; then
+            test_message="${test_message}• SOCKS5 proxy: ${SOCKS5_PROXY} (enabled)\n"
+        fi
+        
+        test_message="${test_message}\n🚀 Happy tunneling!"
+        
+        if send_telegram_message "$test_message"; then
+            print_success "Test message sent! Check your Telegram"
+        else
+            print_warning "Test message may have failed. Check your token and chat ID"
+            sleep 2
+            print_info "If you received the message in Telegram, it's working fine"
+        fi
+    else
+        print_error "❌ Bot service failed to start"
+        journalctl -u $BOT_SERVICE -n 20 --no-pager
+    fi
+    
+    echo ""
+    print_success "✅ Bot setup completed!"
+    pause
+}
+
+# ================================================
+# BOT MANAGEMENT MENU
+# ================================================
+
+telegram_bot_menu() {
+    init_bot_config
+    load_bot_config
+    
+    while true; do
+        clear
+        # show_banner
+        echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║              🤖 Telegram Bot Management                      ║${NC}"
+        echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+        
+        # Status Overview
+        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║                      STATUS OVERVIEW                         ║${NC}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+        
+        # Bot Status
+        if [ "$ENABLE_BOT" = "true" ]; then
+            echo -e "  ${GREEN}●${NC} Bot: ${GREEN}ENABLED${NC}"
+        else
+            echo -e "  ${RED}○${NC} Bot: ${RED}DISABLED${NC}"
+        fi
+        
+        # Configuration Status
+        if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            echo -e "  ${GREEN}✓${NC} Configuration: ${GREEN}Complete${NC}"
+            echo -e "  ${CYAN}  Token: ${BOT_TOKEN:0:15}...${NC}"
+            echo -e "  ${CYAN}  Chat ID: $CHAT_ID${NC}"
+        else
+            echo -e "  ${RED}✗${NC} Configuration: ${RED}Incomplete${NC}"
+        fi
+        
+        # Service Status
+        if systemctl is-active --quiet $BOT_SERVICE 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} Service: ${GREEN}Running${NC}"
+            local uptime=$(systemctl show $BOT_SERVICE -p ActiveEnterTimestamp 2>/dev/null | cut -d= -f2)
+            [ -n "$uptime" ] && echo -e "  ${CYAN}  Started: $uptime${NC}"
+        else
+            echo -e "  ${RED}✗${NC} Service: ${RED}Stopped${NC}"
+        fi
+        
+        # SOCKS5 Status
+        if [ -n "$SOCKS5_PROXY" ] && [ "$USE_SOCKS5" = "true" ]; then
+            echo -e "  ${GREEN}✓${NC} SOCKS5 Proxy: ${CYAN}$SOCKS5_PROXY${NC}"
+        fi
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}MAIN ACTIONS:${NC}"
+        echo -e "  ${WHITE}[S]${NC} 🚀 ${GREEN}Setup Bot Wizard${NC} - Complete setup in one go"
+        echo -e "  ${WHITE}[R]${NC} 🗑️  ${RED}Remove Bot${NC} - Uninstall completely"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}NOTIFICATION SETTINGS:${NC}"
+        echo -e "  ${WHITE}[1]${NC} Boot Report [$( [ "$ENABLE_BOOT_REPORT" = "true" ] && echo "✅ ON" || echo "❌ OFF")]"
+        echo -e "  ${WHITE}[2]${NC} Service Watch [$( [ "$ENABLE_SERVICE_WATCH" = "true" ] && echo "✅ ON" || echo "❌ OFF")]"
+        echo -e "  ${WHITE}[3]${NC} Watch Interval (current: ${CYAN}${WATCH_INTERVAL}s${NC})"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}PROXY SETTINGS:${NC}"
+        echo -e "  ${WHITE}[4]${NC} Toggle SOCKS5 Proxy [$( [ "$USE_SOCKS5" = "true" ] && echo "✅ ON" || echo "❌ OFF")]"
+        echo -e "  ${WHITE}[5]${NC} Set SOCKS5 Proxy (current: ${CYAN}${SOCKS5_PROXY:-Not set}${NC})"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}SERVICE CONTROL:${NC}"
+        echo -e "  ${WHITE}[6]${NC} Start Bot Service"
+        echo -e "  ${WHITE}[7]${NC} Stop Bot Service"
+        echo -e "  ${WHITE}[8]${NC} Restart Bot Service"
+        echo -e "  ${WHITE}[9]${NC} View Bot Logs"
+        echo -e "  ${WHITE}[10]${NC} Test Bot (Send test message)"
+        
+        echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "  ${WHITE}[0]${NC} ↩️ Back to Main Menu"
+        echo ""
+        
+        read -p "Choose option: " bot_choice
+        
+        case $bot_choice in
+            [Ss]) setup_bot_wizard ;;
+            [Rr]) remove_bot ;;
+            
+            1)
+                [ "$ENABLE_BOOT_REPORT" = "true" ] && ENABLE_BOOT_REPORT="false" || ENABLE_BOOT_REPORT="true"
+                save_bot_config
+                print_success "Boot Report: $([ "$ENABLE_BOOT_REPORT" = "true" ] && echo "ON" || echo "OFF")"
+                sleep 1
+                ;;
+            2)
+                [ "$ENABLE_SERVICE_WATCH" = "true" ] && ENABLE_SERVICE_WATCH="false" || ENABLE_SERVICE_WATCH="true"
+                save_bot_config
+                print_success "Service Watch: $([ "$ENABLE_SERVICE_WATCH" = "true" ] && echo "ON" || echo "OFF")"
+                sleep 1
+                ;;
+            3)
+                echo -e "\n${YELLOW}Enter watch interval in seconds (30-3600):${NC}"
+                read -p "> " new_interval
+                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 30 ] && [ "$new_interval" -le 3600 ]; then
+                    WATCH_INTERVAL="$new_interval"
+                    save_bot_config
+                    print_success "Watch interval set to ${WATCH_INTERVAL}s"
+                    
+                    if systemctl is-active --quiet $BOT_SERVICE; then
+                        systemctl restart $BOT_SERVICE
+                        print_info "Bot service restarted to apply new interval"
+                    fi
+                else
+                    print_error "Invalid interval (must be 30-3600)"
+                    sleep 2
+                fi
+                ;;
+            4)
+                if [ -n "$SOCKS5_PROXY" ]; then
+                    [ "$USE_SOCKS5" = "true" ] && USE_SOCKS5="false" || USE_SOCKS5="true"
+                    save_bot_config
+                    print_success "SOCKS5 Proxy: $([ "$USE_SOCKS5" = "true" ] && echo "ON" || echo "OFF")"
+                    sleep 1
+                else
+                    print_error "Please set SOCKS5 proxy first (option 5)"
+                    sleep 2
+                fi
+                ;;
+            5)
+                echo -e "\n${YELLOW}Enter SOCKS5 proxy (host:port):${NC}"
+                read -p "> " new_proxy
+                if [ -n "$new_proxy" ]; then
+                    SOCKS5_PROXY="$new_proxy"
+                    USE_SOCKS5="true"
+                    save_bot_config
+                    print_success "SOCKS5 proxy set to $SOCKS5_PROXY"
+                    sleep 1
+                fi
+                ;;
+            6)
+                if [ ! -f "$BOT_SCRIPT" ]; then
+                    create_bot_script
+                fi
+                if [ ! -f "/etc/systemd/system/$BOT_SERVICE.service" ]; then
+                    create_bot_service
+                fi
+                systemctl start $BOT_SERVICE
+                sleep 2
+                if systemctl is-active --quiet $BOT_SERVICE; then
+                    print_success "Bot service started"
+                else
+                    print_error "Failed to start bot service"
+                    journalctl -u $BOT_SERVICE -n 10 --no-pager
+                fi
+                sleep 1
+                ;;
+            7)
+                systemctl stop $BOT_SERVICE
+                print_info "Bot service stopped"
+                sleep 1
+                ;;
+            8)
+                systemctl restart $BOT_SERVICE
+                sleep 2
+                if systemctl is-active --quiet $BOT_SERVICE; then
+                    print_success "Bot service restarted"
+                else
+                    print_error "Failed to restart bot service"
+                fi
+                sleep 1
+                ;;
+            9)
+                echo -e "\n${CYAN}Last 20 lines of bot log:${NC}\n"
+                if [ -f "$BOT_LOG_FILE" ]; then
+                    tail -20 "$BOT_LOG_FILE"
+                else
+                    journalctl -u $BOT_SERVICE -n 20 --no-pager
+                fi
+                echo ""
+                pause
+                ;;
+            10)
+                if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ "$ENABLE_BOT" = "true" ]; then
+                    print_step "Sending test message..."
+                    local test_msg="✅ <b>Paqet Bot Test</b>\n\n"
+                    test_msg+="If you see this, bot is working correctly!\n"
+                    test_msg+="Time: $(date '+%Y-%m-%d %H:%M:%S')"
+                    
+                    if send_telegram_message "$test_msg"; then
+                        print_success "Test message sent! Check your Telegram"
+                    else
+                        print_error "Failed to send message. Check token and chat ID."
+                    fi
+                else
+                    print_error "Bot not properly configured or enabled"
+                    print_info "Please run Setup Wizard [S] first"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) print_error "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
 # ================================================
 # MAIN MENU
 # ================================================
@@ -3416,10 +5683,11 @@ main_menu() {
         echo -e "${CYAN}6.${NC}📊 Test Connection"
         echo -e "${CYAN}7.${NC}🚀 Optimize Server"
         echo -e "${CYAN}8.${NC}🗑️  Uninstall Paqet"
-        echo -e "${CYAN}9.${NC}🚪 Exit"
+        echo -e "${CYAN}9.${NC}🤖 Telegram Bot Manager"
+        echo -e "${CYAN}10.${NC}🚪 Exit"
         echo ""
         
-        read -p "Select option [0-9]: " choice
+        read -p "Select option [0-10]: " choice
         
         case $choice in
             0) install_paqet ;;
@@ -3431,7 +5699,8 @@ main_menu() {
             6) test_connection ;;
             7) optimize_server ;;
             8) uninstall_paqet ;;
-            9)
+            9) telegram_bot_menu ;;
+            10)
                 echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
                 echo -e "${GREEN} Goodbye! ${NC}"
                 echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}\n"
